@@ -8822,7 +8822,7 @@ mod rotate_field_text_tests {
     /// The angle comes back because the turn must leave it alone: KiCad adds
     /// the symbol's rotation when it draws, so turning the stored angle here
     /// would draw the text at twice the angle.
-    fn field_positions(source: &str, reference: &str) -> [(f64, f64, f64); 2] {
+    pub(super) fn field_positions(source: &str, reference: &str) -> [(f64, f64, f64); 2] {
         let schematic =
             cse::Schematic::from_source(std::path::Path::new("sheet"), source.to_string())
                 .expect("fixture parses");
@@ -8854,7 +8854,7 @@ mod rotate_field_text_tests {
     /// KiCad writes these coordinates to four decimals. Compare on that scale,
     /// so the last bit of the twin subtraction does not decide a geometric
     /// claim — 50.8 and 50.800000000000004 are the same point on a sheet.
-    fn to_nanometres(fields: [(f64, f64, f64); 2]) -> [(i64, i64, i64); 2] {
+    pub(super) fn to_nanometres(fields: [(f64, f64, f64); 2]) -> [(i64, i64, i64); 2] {
         fields.map(|(x, y, angle)| {
             (
                 (x * 1_000_000.0).round() as i64,
@@ -8986,6 +8986,209 @@ mod rotate_field_text_tests {
             field_positions(&std::fs::read_to_string(&path).unwrap(), "R1")[0],
             (101.6, 137.668, 90.0)
         );
+    }
+}
+
+/// Reflecting a placed symbol owes its field text the same reflection (#613):
+/// a field's `(at …)` is an absolute sheet coordinate, so writing the token
+/// alone leaves Reference and Value on the unreflected side of the body.
+///
+/// No tool mirrors a placed symbol yet (#450), so these cases drive
+/// `Symbol::set_mirror` directly, on `mirror_fields_kicad10.kicad_sch` —
+/// KiCad 10.0.6's own serialization, built in twins like
+/// `rotate_fields_kicad10`: a symbol, and the same symbol placed with the
+/// target reflection `TWIN_OFFSET_MM` below it. See its README for provenance
+/// and the `kicad-cli sch export svg` anchors.
+#[cfg(test)]
+mod mirror_field_text_tests {
+    use super::rotate_field_text_tests::{field_positions, to_nanometres};
+    use super::*;
+
+    const SHEET: &str = include_str!("../../tests/fixtures/mirror_fields_kicad10.kicad_sch");
+    /// Drawn in KiCad, not built by Konnect: its mirrored connectors carry
+    /// fields on the reflected library anchors, as eeschema wrote them.
+    const DEMO: &str =
+        include_str!("../../tests/fixtures/project_ownership/complex_hierarchy.kicad_sch");
+
+    /// How far below each symbol its reflected twin sits.
+    const TWIN_OFFSET_MM: f64 = 25.4;
+
+    /// Reflect `reference` to `mirror` and read its fields back from the
+    /// written sheet.
+    fn mirrored(source: &str, reference: &str, mirror: Option<&str>) -> [(f64, f64, f64); 2] {
+        let mut schematic =
+            cse::Schematic::from_source(std::path::Path::new("sheet"), source.to_string())
+                .expect("fixture parses");
+        schematic
+            .symbols
+            .iter_mut()
+            .find(|symbol| symbol.reference() == Some(reference))
+            .expect("placed symbol")
+            .set_mirror(mirror);
+        field_positions(&schematic.to_source(), reference)
+    }
+
+    /// `twin`'s fields, lifted by the offset between the two placements.
+    fn twin(reference: &str) -> [(i64, i64, i64); 2] {
+        to_nanometres(
+            field_positions(SHEET, reference).map(|(x, y, angle)| (x, y - TWIN_OFFSET_MM, angle)),
+        )
+    }
+
+    /// A `Device:LED` anchors Reference above the origin and Value below;
+    /// `(mirror x)` negates screen-Y, so the two trade sides — landing on D2,
+    /// the same LED placed reflected. The literal is stated too, so the
+    /// fixture and the code agreeing on a wrong point would still fail.
+    #[test]
+    fn mirroring_x_reflects_field_text_across_the_body() {
+        let reflected = mirrored(SHEET, "D1", Some("x"));
+        assert_eq!(reflected, [(101.6, 53.34, 0.0), (101.6, 48.26, 0.0)]);
+        assert_eq!(to_nanometres(reflected), twin("D2"));
+    }
+
+    /// `(mirror y)` negates screen-X. U1's Reference sits off both axes, so
+    /// only the X offset may change.
+    #[test]
+    fn mirroring_y_reflects_field_text_left_to_right() {
+        let reflected = mirrored(SHEET, "U1", Some("y"));
+        assert_eq!(reflected[0], (144.78, 45.085, 0.0));
+        assert_eq!(to_nanometres(reflected), twin("U2"));
+    }
+
+    /// A placement rotates first and mirrors second, so on a turned body
+    /// `(mirror x)` still negates *screen*-Y: U3 at 90° keeps its Reference's
+    /// X offset and flips its Y. U4 was placed by the same transform, so this
+    /// shows reflecting agrees with placing reflected; the order itself is
+    /// pinned by the KiCad-drawn L2 case below.
+    #[test]
+    fn mirroring_a_turned_symbol_reflects_in_sheet_axes() {
+        let reflected = mirrored(SHEET, "U3", Some("x"));
+        assert_eq!(reflected[0], (172.085, 45.72, 0.0));
+        assert_eq!(to_nanometres(reflected), twin("U4"));
+    }
+
+    /// Swapping one axis for the other is two reflections — both offsets flip.
+    #[test]
+    fn swapping_the_mirror_axis_flips_both_offsets() {
+        let reflected = mirrored(SHEET, "U5", Some("y"));
+        assert_eq!(reflected[0], (220.98, 45.085, 0.0));
+        assert_eq!(to_nanometres(reflected), twin("U6"));
+    }
+
+    /// Clearing the mirror is a reflection too: U7 comes back to U8's fields.
+    #[test]
+    fn clearing_the_mirror_reflects_field_text_back() {
+        let reflected = mirrored(SHEET, "U7", None);
+        assert_eq!(reflected[0], (134.62, 95.885, 0.0));
+        assert_eq!(to_nanometres(reflected), twin("U8"));
+    }
+
+    /// KiCad drew these, not Konnect. P102 is a `CONN_2` placed `(mirror y)`
+    /// whose library anchors put Reference at local x = −1.27 and Value at
+    /// +1.27; eeschema wrote them reflected, at 43.18 and 40.64 about the
+    /// origin at 41.91. Clearing the mirror must put each on its library side.
+    #[test]
+    fn clearing_a_kicad_drawn_mirror_restores_the_library_anchors() {
+        assert_eq!(
+            field_positions(DEMO, "P102"),
+            [(43.18, 66.04, 90.0), (40.64, 66.04, 90.0)]
+        );
+
+        assert_eq!(
+            mirrored(DEMO, "P102", None),
+            [(40.64, 66.04, 90.0), (43.18, 66.04, 90.0)]
+        );
+    }
+
+    /// The twins above take their answer from Konnect's own placement
+    /// transform, so they cannot tell whether that transform mirrors before or
+    /// after it turns. KiCad can. L2 is an `INDUCTOR` at 270° with
+    /// `(mirror x)`, whose library anchors its Value at (2.54, 0); eeschema
+    /// wrote it 2.54mm *above* the origin, where rotate-then-mirror puts it
+    /// and mirror-then-rotate does not. Unreflected, the turn alone puts it
+    /// 2.54mm below. A reflection taken in the symbol's own frame would move X
+    /// instead and leave it above.
+    ///
+    /// The sheet is KiCad's `video` demo, read from the local install because
+    /// its CC BY-SA licence keeps it out of the repo. The test skips when no
+    /// install is found, or when the installed sheet no longer places L2 so.
+    #[test]
+    fn clearing_a_kicad_drawn_mirror_on_a_turned_symbol_reflects_in_sheet_axes() {
+        let Some(video) = installed_demo("video/modul.kicad_sch") else {
+            eprintln!("SKIP: no KiCad demos found (set KICAD_DEMOS to enable)");
+            return;
+        };
+        let schematic = cse::Schematic::from_source(std::path::Path::new("sheet"), video.clone())
+            .expect("demo parses");
+        let Some(l2) = schematic
+            .symbols
+            .iter()
+            .find(|symbol| symbol.reference() == Some("L2"))
+            .filter(|l2| l2.at.rotation == Some(270.0) && l2.mirror.as_deref() == Some("x"))
+        else {
+            eprintln!("SKIP: video/modul.kicad_sch no longer places L2 at 270° with (mirror x)");
+            return;
+        };
+        // Offsets from L2's origin, so a demo that moves L2 still checks.
+        let (x, y) = (l2.at.x, l2.at.y);
+        let value_offset = |fields: [(f64, f64, f64); 2]| {
+            to_nanometres(fields.map(|(fx, fy, angle)| (fx - x, fy - y, angle)))[1]
+        };
+        let expected = |dy: f64| to_nanometres([(0.0, dy, 90.0); 2])[1];
+
+        assert_eq!(value_offset(field_positions(&video, "L2")), expected(-2.54));
+
+        assert_eq!(value_offset(mirrored(&video, "L2", None)), expected(2.54));
+    }
+
+    /// A KiCad demo sheet under `KICAD_DEMOS`, else under the standard install
+    /// paths — the lookup `tests/conformance_test.rs` uses.
+    fn installed_demo(sheet: &str) -> Option<String> {
+        let override_dir = std::env::var_os("KICAD_DEMOS").map(std::path::PathBuf::from);
+        let candidates: &[&str] = if cfg!(target_os = "windows") {
+            &[
+                r"C:\KiCad\10.0\share\kicad\demos",
+                r"C:\Program Files\KiCad\10.0\share\kicad\demos",
+            ]
+        } else if cfg!(target_os = "macos") {
+            &["/Applications/KiCad/KiCad.app/Contents/SharedSupport/demos"]
+        } else {
+            &["/usr/share/kicad/demos", "/usr/local/share/kicad/demos"]
+        };
+        override_dir
+            .into_iter()
+            .chain(candidates.iter().map(std::path::PathBuf::from))
+            .find(|dir| dir.exists())
+            .and_then(|dir| std::fs::read_to_string(dir.join(sheet)).ok())
+    }
+
+    /// A field the caller moved by hand keeps its offset, reflected with the
+    /// body rather than reset. D3's Reference was dragged 10mm right of and
+    /// 10mm above its origin before the resave.
+    #[test]
+    fn mirroring_carries_a_hand_placed_field_offset_across() {
+        assert_eq!(field_positions(SHEET, "D3")[0], (111.6, 91.6, 0.0));
+
+        assert_eq!(mirrored(SHEET, "D3", Some("x"))[0], (111.6, 111.6, 0.0));
+    }
+
+    /// Reflecting and reflecting back restores the sheet byte for byte.
+    #[test]
+    fn mirroring_there_and_back_restores_the_sheet() {
+        let parse = || {
+            cse::Schematic::from_source(std::path::Path::new("sheet"), SHEET.to_string())
+                .expect("fixture parses")
+        };
+        let baseline = parse().to_source();
+        let mut schematic = parse();
+        for symbol in &mut schematic.symbols {
+            let mirror = symbol.mirror.clone();
+            for step in [Some("x"), Some("y"), None] {
+                symbol.set_mirror(step);
+            }
+            symbol.set_mirror(mirror.as_deref());
+        }
+        assert_eq!(schematic.to_source(), baseline);
     }
 }
 
