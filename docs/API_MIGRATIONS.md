@@ -23,7 +23,7 @@ it. `10k` used to match `110kΩ` and `510kΩ`, and `20pF` matched `220pF`. Unit
 spellings are not converted; `100nF` does not find `0.1uF`. An empty value is
 refused.
 
-Results used to be ordered by price alone. Parts with fewer than `min_stock`
+Results used to be ordered by price alone. Parts with fewer than `min_stock_count`
 units in stock (new, default 100) are now excluded. The rest are ranked Basic,
 then Preferred, then Extended when `prefer_basic` (new, default true) is on,
 then known price before unknown, price ascending, stock descending and LCSC

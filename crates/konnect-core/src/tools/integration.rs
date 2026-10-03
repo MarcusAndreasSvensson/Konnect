@@ -91,7 +91,7 @@ pub fn tools() -> Vec<ToolDef> {
                     "value": { "type": "string", "description": "Component value or part number, matched case-insensitively as a whole value (no digit or '.' directly before or after) against the part description and manufacturer part number, e.g. '100nF', '10k', 'AMS1117-3.3'. Unit spellings are not converted: '100nF' does not find '0.1uF'" },
                     "footprint": { "type": "string", "description": "KiCad footprint ID such as 'Capacitor_SMD:C_0402_1005Metric', or LCSC's own package name without a library prefix, such as '0402' or 'LQFP-48(7x7)'. A library footprint with no known LCSC package is refused" },
                     "max_price_usd": { "type": "number", "description": "Keep only parts whose known unit price is at or below this, in USD (optional). Parts with an unknown price are excluded when it is set" },
-                    "min_stock": { "type": "integer", "minimum": 0, "description": "Exclude parts with fewer units in stock. Raise it to the build quantity", "default": 100 },
+                    "min_stock_count": { "type": "integer", "minimum": 0, "description": "Exclude parts with fewer units in stock. Raise it to the build quantity", "default": 100 },
                     "prefer_basic": { "type": "boolean", "description": "Rank JLCPCB Basic parts first, then Preferred, then Extended, before price. Extended parts add a setup fee per unique part", "default": true },
                     "limit": { "type": "integer", "description": "Maximum number of suggestions", "default": 5 }
                 },
@@ -744,17 +744,17 @@ async fn handle_get_jlcpcb_part(
 /// part adds one.
 const LIBRARY_TYPE_ORDER: [&str; 3] = ["Basic", "Preferred", "Extended"];
 
-const SUGGEST_DEFAULT_MIN_STOCK: u64 = 100;
+const SUGGEST_DEFAULT_MIN_STOCK_COUNT: u64 = 100;
 
 /// A part that matched both the value and the package, with the columns the
 /// stock floor, price limit and ranking read.
 #[derive(Debug, Clone)]
 struct AlternativeCandidate {
     part: serde_json::Value,
-    lcsc: String,
+    lcsc_id: String,
     library_type: String,
     price: f64,
-    stock: i64,
+    stock_count: i64,
 }
 
 impl AlternativeCandidate {
@@ -774,7 +774,7 @@ impl AlternativeCandidate {
 
 #[derive(Debug, Clone, Copy)]
 struct AlternativePolicy {
-    min_stock: u64,
+    min_stock_count: u64,
     prefer_basic: bool,
     max_price: Option<f64>,
     limit: usize,
@@ -818,10 +818,10 @@ fn rank_alternatives(
         matched: candidates.len(),
         ..AlternativeCounts::default()
     };
-    let min_stock = i64::try_from(policy.min_stock).unwrap_or(i64::MAX);
+    let min_stock_count = i64::try_from(policy.min_stock_count).unwrap_or(i64::MAX);
     let mut kept: Vec<AlternativeCandidate> = Vec::new();
     for candidate in candidates {
-        if candidate.stock < min_stock {
+        if candidate.stock_count < min_stock_count {
             counts.below_min_stock += 1;
         } else if let Some(max_price) = policy.max_price {
             if !candidate.price_known() {
@@ -848,8 +848,8 @@ fn rank_alternatives(
             .cmp(&tier(b))
             .then(b.price_known().cmp(&a.price_known()))
             .then(a.price.total_cmp(&b.price))
-            .then(b.stock.cmp(&a.stock))
-            .then(a.lcsc.cmp(&b.lcsc))
+            .then(b.stock_count.cmp(&a.stock_count))
+            .then(a.lcsc_id.cmp(&b.lcsc_id))
     });
     kept.truncate(policy.limit);
     counts.returned = kept.len();
@@ -892,10 +892,10 @@ fn query_alternative_candidates(
                 description,
                 AlternativeCandidate {
                     part: row_to_part_json(row)?,
-                    lcsc: row.get::<_, Option<String>>(0)?.unwrap_or_default(),
+                    lcsc_id: row.get::<_, Option<String>>(0)?.unwrap_or_default(),
                     library_type: row.get::<_, Option<String>>(4)?.unwrap_or_default(),
                     price: row.get::<_, Option<f64>>(7)?.unwrap_or(0.0),
-                    stock: row.get::<_, Option<i64>>(8)?.unwrap_or(0),
+                    stock_count: row.get::<_, Option<i64>>(8)?.unwrap_or(0),
                 },
             ))
         })?
@@ -956,9 +956,9 @@ async fn handle_suggest_alternatives(
         ));
     }
     let policy = AlternativePolicy {
-        min_stock: args["min_stock"]
+        min_stock_count: args["min_stock_count"]
             .as_u64()
-            .unwrap_or(SUGGEST_DEFAULT_MIN_STOCK),
+            .unwrap_or(SUGGEST_DEFAULT_MIN_STOCK_COUNT),
         prefer_basic: args["prefer_basic"].as_bool().unwrap_or(true),
         max_price: args["max_price_usd"].as_f64(),
         limit: args["limit"].as_u64().unwrap_or(5) as usize,
@@ -972,7 +972,7 @@ async fn handle_suggest_alternatives(
             &footprint,
             &policy.max_price.map(|v| v.to_string()).unwrap_or_default(),
             &policy.limit.to_string(),
-            &policy.min_stock.to_string(),
+            &policy.min_stock_count.to_string(),
             &policy.prefer_basic.to_string(),
         ],
     );
@@ -1006,7 +1006,7 @@ async fn handle_suggest_alternatives(
         "ranking": {
             "criteria": policy.criteria(),
             "prefer_basic": policy.prefer_basic,
-            "min_stock": policy.min_stock,
+            "min_stock_count": policy.min_stock_count,
             "max_price_usd": policy.max_price
         },
         "count": counts.returned,
@@ -3023,7 +3023,7 @@ mod suggest_alternatives_tests {
                 "LCSC number"
             ])
         );
-        assert_eq!(body["ranking"]["min_stock"], 100);
+        assert_eq!(body["ranking"]["min_stock_count"], 100);
         assert_eq!(body["ranking"]["prefer_basic"], true);
         assert_eq!(body["count"], 5);
         assert_eq!(body["matched_count"], 9);
@@ -3047,7 +3047,7 @@ mod suggest_alternatives_tests {
             json!({
                 "value": "10k",
                 "footprint": "Resistor_SMD:R_0402_1005Metric",
-                "min_stock": 0,
+                "min_stock_count": 0,
                 "limit": 50
             }),
         )
@@ -3128,7 +3128,7 @@ mod suggest_alternatives_tests {
             json!({
                 "value": "100nF",
                 "footprint": "0402",
-                "min_stock": 0,
+                "min_stock_count": 0,
                 "prefer_basic": false
             }),
         )
