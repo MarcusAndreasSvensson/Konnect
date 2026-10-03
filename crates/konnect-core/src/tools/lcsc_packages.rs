@@ -544,4 +544,136 @@ mod tests {
         assert!(contains_whole_value("LM358DR2G", "LM358"));
         assert!(!contains_whole_value("anything", ""));
     }
+
+    /// Where an installed KiCad keeps its footprint libraries:
+    /// `KICAD10_FOOTPRINT_DIR` or `KICAD_FOOTPRINT_DIR` first, then the
+    /// standard install paths, as the demo-corpus tests find theirs.
+    fn installed_footprint_dir() -> Option<std::path::PathBuf> {
+        let overrides = ["KICAD10_FOOTPRINT_DIR", "KICAD_FOOTPRINT_DIR"]
+            .iter()
+            .filter_map(std::env::var_os)
+            .map(std::path::PathBuf::from);
+        let candidates: &[&str] = if cfg!(target_os = "windows") {
+            &[
+                r"C:\KiCad\10.0\share\kicad\footprints",
+                r"C:\Program Files\KiCad\10.0\share\kicad\footprints",
+            ]
+        } else if cfg!(target_os = "macos") {
+            &["/Applications/KiCad/KiCad.app/Contents/SharedSupport/footprints"]
+        } else {
+            &[
+                "/usr/share/kicad/footprints",
+                "/usr/local/share/kicad/footprints",
+            ]
+        };
+        overrides
+            .chain(candidates.iter().map(std::path::PathBuf::from))
+            .find(|dir| dir.join("Resistor_SMD.pretty").is_dir())
+    }
+
+    /// Every footprint KiCad ships in its SMD libraries, read from the
+    /// installed library and run through the mapping. Each mapped footprint
+    /// obeys its rule; none is mistaken for an LCSC name; and each library
+    /// keeps at least about 90% of the coverage KiCad 10.0.5's library gave
+    /// (Resistor_SMD 36, Capacitor_SMD 28, Inductor_SMD 24, Diode_SMD 41,
+    /// LED_SMD 21, Fuse 18, Package_TO_SOT_SMD 28, Package_SO 143, Package_QFP
+    /// 68, Package_DFN_QFN 551). Skipped when no KiCad is installed.
+    #[test]
+    fn kicad_library_footprints_map_by_their_rules() {
+        let Some(dir) = installed_footprint_dir() else {
+            eprintln!("SKIP: no KiCad footprint library found (set KICAD10_FOOTPRINT_DIR)");
+            return;
+        };
+        const LIBRARIES: [(&str, usize); 10] = [
+            ("Resistor_SMD", 32),
+            ("Capacitor_SMD", 25),
+            ("Inductor_SMD", 21),
+            ("Diode_SMD", 36),
+            ("LED_SMD", 18),
+            ("Fuse", 16),
+            ("Package_TO_SOT_SMD", 25),
+            ("Package_SO", 128),
+            ("Package_QFP", 61),
+            ("Package_DFN_QFN", 495),
+        ];
+        for (library, floor) in LIBRARIES {
+            let mut names: Vec<String> = std::fs::read_dir(dir.join(format!("{library}.pretty")))
+                .unwrap_or_else(|e| panic!("{library}: {e}"))
+                .filter_map(|entry| {
+                    let path = entry.ok()?.path();
+                    (path.extension()? == "kicad_mod")
+                        .then(|| path.file_stem()?.to_str().map(str::to_owned))
+                        .flatten()
+                })
+                .collect();
+            names.sort();
+            let mut mapped = 0;
+            for name in &names {
+                let id = format!("{library}:{name}");
+                let Some(found) = lcsc_packages(&id) else {
+                    continue;
+                };
+                mapped += 1;
+                assert!(
+                    !found.packages.is_empty()
+                        && found
+                            .packages
+                            .iter()
+                            .all(|p| !p.is_empty() && !p.contains(':')),
+                    "{id}: {found:?}"
+                );
+                match found.rule {
+                    PackageRule::ChipImperial => {
+                        let code = name.split('_').nth(1).expect("a size code");
+                        assert_eq!(found.packages, [code], "{id}");
+                    }
+                    PackageRule::GullWing | PackageRule::BodySize => {
+                        let pins = IcName::parse(name).expect("an IC name").pins;
+                        let marker = format!("-{pins}");
+                        assert!(
+                            found.packages.iter().all(|p| p.contains(&marker)),
+                            "{id}: {found:?}"
+                        );
+                    }
+                    PackageRule::NamedPackage => {
+                        assert!(named_package(name).is_some(), "{id}")
+                    }
+                    PackageRule::LcscName => {
+                        panic!("{id}: a library footprint was taken as an LCSC name")
+                    }
+                }
+            }
+            assert!(
+                mapped >= floor,
+                "{library}: only {mapped} of {} footprints map (expected at least {floor})",
+                names.len()
+            );
+        }
+
+        // Footprints whose LCSC names were measured against the catalogue are
+        // real names in this library, and map to those names.
+        for (library, name, lcsc) in [
+            ("Capacitor_SMD", "C_0402_1005Metric", "0402"),
+            ("Package_TO_SOT_SMD", "SOT-23", "SOT-23"),
+            ("Package_TO_SOT_SMD", "SOT-223-3_TabPin2", "SOT-223"),
+            ("Package_SO", "SOIC-8_3.9x4.9mm_P1.27mm", "SOIC-8"),
+            (
+                "Package_DFN_QFN",
+                "QFN-48-1EP_7x7mm_P0.5mm_EP5.6x5.6mm",
+                "UFQFPN-48(7x7)",
+            ),
+            ("Diode_SMD", "D_SMA", "SMA(DO-214AC)"),
+        ] {
+            assert!(
+                dir.join(format!("{library}.pretty/{name}.kicad_mod"))
+                    .is_file(),
+                "{library}:{name} is not in the installed library"
+            );
+            let found = lcsc_packages(&format!("{library}:{name}")).expect("mapped");
+            assert!(
+                found.packages.iter().any(|p| p == lcsc),
+                "{library}:{name}: {found:?}"
+            );
+        }
+    }
 }
