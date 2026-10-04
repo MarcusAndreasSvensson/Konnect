@@ -107,8 +107,8 @@ pub fn tools() -> Vec<ToolDef> {
                                 "shape": { "type": "string", "description": "'rect', 'oval', 'circle', 'roundrect'" },
                                 "x": { "type": "number" },
                                 "y": { "type": "number" },
-                                "width": { "type": "number" },
-                                "height": { "type": "number" },
+                                "width": { "type": "number", "exclusiveMinimum": 0 },
+                                "height": { "type": "number", "exclusiveMinimum": 0 },
                                 "drill": { "type": "number", "description": "Drill diameter for thru-hole pads" },
                                 "layers": {
                                     "type": "array",
@@ -129,10 +129,10 @@ pub fn tools() -> Vec<ToolDef> {
                             "required": ["number", "type", "shape", "x", "y", "width", "height"]
                         }
                     },
-                    "body_width": { "type": "number", "description": "Physical component body width in mm (optional; used for silk/fab outlines). Falls back to the pad envelope if omitted." },
-                    "body_height": { "type": "number", "description": "Physical component body height in mm (optional)." },
+                    "body_width": { "type": "number", "exclusiveMinimum": 0, "description": "Physical component body width in mm (optional; used for fab and courtyard outlines when both body dimensions are supplied). Falls back to the pad envelope if omitted." },
+                    "body_height": { "type": "number", "exclusiveMinimum": 0, "description": "Physical component body height in mm (optional)." },
                     "package_type": { "type": "string", "description": "'smd' (0.25mm courtyard), 'through_hole' (0.5mm), 'small' (0.15mm, <0603), or 'bga' (1.0mm). Sets courtyard clearance when courtyard_clearance is not given." },
-                    "courtyard_clearance": { "type": "number", "description": "Explicit courtyard clearance in mm (overrides package_type / auto-detection)." },
+                    "courtyard_clearance": { "type": "number", "minimum": 0, "description": "Explicit courtyard clearance in mm (overrides package_type / auto-detection)." },
                     "model": {
                         "type": "object",
                         "description": "Optional 3D model to associate with the footprint.",
@@ -399,8 +399,9 @@ pub fn tools() -> Vec<ToolDef> {
             json!({
                 "type": "object",
                 "properties": {
-                    "query": { "type": "string", "description": "Search string (partial name or keyword)" },
-                    "limit": { "type": "integer", "description": "Maximum number of results to return", "default": 50 }
+                    "query": { "type": "string", "description": "Search string (case-insensitive partial name, tags, or description match)" },
+                    "limit": { "type": "integer", "description": "Maximum number of results to return", "default": 50 },
+                    "project_dir": { "type": "string", "description": "Project directory whose fp-lib-table is also searched, shadowing global libraries of the same nickname. Defaults to the configured project_dir." }
                 },
                 "required": ["query"]
             }),
@@ -455,6 +456,7 @@ struct PadGeom {
     y: f64,
     w: f64,
     h: f64,
+    rotation: f64,
 }
 
 /// Axis-aligned bounding box `(min_x, min_y, max_x, max_y)` over pad extents.
@@ -468,6 +470,25 @@ fn pads_bbox(pads: &[PadGeom]) -> (f64, f64, f64, f64) {
         min_y = min_y.min(p.y - p.h / 2.0);
         max_x = max_x.max(p.x + p.w / 2.0);
         max_y = max_y.max(p.y + p.h / 2.0);
+    }
+    (min_x, min_y, max_x, max_y)
+}
+
+/// Envelope of each pad's rotated local bounding rectangle. Keep the nominal
+/// `pads_bbox` for the existing body centre, silk outline, and pin-1 placement.
+fn rotated_pads_bbox(pads: &[PadGeom]) -> (f64, f64, f64, f64) {
+    let mut min_x = f64::INFINITY;
+    let mut min_y = f64::INFINITY;
+    let mut max_x = f64::NEG_INFINITY;
+    let mut max_y = f64::NEG_INFINITY;
+    for p in pads {
+        let (sin, cos) = p.rotation.rem_euclid(360.0).to_radians().sin_cos();
+        let hx = p.w / 2.0 * cos.abs() + p.h / 2.0 * sin.abs();
+        let hy = p.w / 2.0 * sin.abs() + p.h / 2.0 * cos.abs();
+        min_x = min_x.min(p.x - hx);
+        min_y = min_y.min(p.y - hy);
+        max_x = max_x.max(p.x + hx);
+        max_y = max_y.max(p.y + hy);
     }
     (min_x, min_y, max_x, max_y)
 }
@@ -617,13 +638,32 @@ fn build_footprint_graphics(args: &serde_json::Value, name: &str, pads: &[PadGeo
         body,
     );
 
-    // Courtyard: pad envelope + clearance.
-    let (cmin_x, cmin_y, cmax_x, cmax_y) = (
-        pmin_x - clearance,
-        pmin_y - clearance,
-        pmax_x + clearance,
-        pmax_y + clearance,
-    );
+    // Fab: preserve the body centre at the nominal pad envelope's centre.
+    let (fmin_x, fmin_y, fmax_x, fmax_y) = match body {
+        Some((bw, bh)) => {
+            let cx = (pmin_x + pmax_x) / 2.0;
+            let cy = (pmin_y + pmax_y) / 2.0;
+            (cx - bw / 2.0, cy - bh / 2.0, cx + bw / 2.0, cy + bh / 2.0)
+        }
+        None => (pmin_x, pmin_y, pmax_x, pmax_y),
+    };
+
+    // Courtyard: union of the body and rotated pad envelopes, then clearance.
+    let (rmin_x, rmin_y, rmax_x, rmax_y) = rotated_pads_bbox(pads);
+    let (cmin_x, cmin_y, cmax_x, cmax_y) = match body {
+        Some(_) => (
+            rmin_x.min(fmin_x) - clearance,
+            rmin_y.min(fmin_y) - clearance,
+            rmax_x.max(fmax_x) + clearance,
+            rmax_y.max(fmax_y) + clearance,
+        ),
+        None => (
+            rmin_x - clearance,
+            rmin_y - clearance,
+            rmax_x + clearance,
+            rmax_y + clearance,
+        ),
+    };
 
     // Silk: just outside the pad envelope so it clears pads (avoids the
     // silk-over-pad DRC violation) regardless of the body outline.
@@ -634,17 +674,6 @@ fn build_footprint_graphics(args: &serde_json::Value, name: &str, pads: &[PadGeo
         pmax_x + silk_margin,
         pmax_y + silk_margin,
     );
-
-    // Fab: the component body when given, else the pad envelope. May overlap
-    // pads — fab is a documentation layer, not subject to silk-over-pad rules.
-    let (fmin_x, fmin_y, fmax_x, fmax_y) = match body {
-        Some((bw, bh)) => {
-            let cx = (pmin_x + pmax_x) / 2.0;
-            let cy = (pmin_y + pmax_y) / 2.0;
-            (cx - bw / 2.0, cy - bh / 2.0, cx + bw / 2.0, cy + bh / 2.0)
-        }
-        None => (pmin_x, pmin_y, pmax_x, pmax_y),
-    };
 
     let mut s = String::new();
 
@@ -740,6 +769,25 @@ async fn handle_create_footprint(
     if let Err(error) = validate_footprint_pad_items(&pads_val) {
         return Ok(error);
     }
+    for field in ["body_width", "body_height", "courtyard_clearance"] {
+        let Some(value) = args.get(field) else {
+            continue;
+        };
+        let non_negative = field == "courtyard_clearance";
+        let valid = value
+            .as_f64()
+            .is_some_and(|n| n.is_finite() && if non_negative { n >= 0.0 } else { n > 0.0 });
+        if !valid {
+            return Ok(invalid_library_argument(
+                field,
+                if non_negative {
+                    "must be a finite non-negative number"
+                } else {
+                    "must be a finite number greater than zero"
+                },
+            ));
+        }
+    }
     let mut pad_geoms: Vec<PadGeom> = Vec::new();
     let mut pad_sexp = String::new();
     for pad in &pads_val {
@@ -825,6 +873,7 @@ async fn handle_create_footprint(
             y,
             w,
             h,
+            rotation,
         });
     }
 
@@ -887,10 +936,30 @@ fn validate_footprint_pad_items(pads: &[serde_json::Value]) -> Result<(), CallTo
             }
         }
         for field in ["x", "y", "width", "height"] {
-            if pad[field].as_f64().is_none() {
+            let Some(number) = pad[field].as_f64() else {
                 return Err(invalid_library_argument(
                     &format!("pads[{index}].{field}"),
                     "missing or not a number",
+                ));
+            };
+            if !number.is_finite() {
+                return Err(invalid_library_argument(
+                    &format!("pads[{index}].{field}"),
+                    "must be finite",
+                ));
+            }
+            if matches!(field, "width" | "height") && number <= 0.0 {
+                return Err(invalid_library_argument(
+                    &format!("pads[{index}].{field}"),
+                    "must be greater than zero",
+                ));
+            }
+        }
+        if let Some(rotation) = pad.get("rotation") {
+            if !rotation.as_f64().is_some_and(f64::is_finite) {
+                return Err(invalid_library_argument(
+                    &format!("pads[{index}].rotation"),
+                    "must be a finite number",
                 ));
             }
         }
@@ -1583,13 +1652,20 @@ fn kicad_user_path_vars() -> std::collections::HashMap<String, String> {
 
 fn expand_lib_uri(uri: &str, kiprjmod: Option<&Path>) -> Option<PathBuf> {
     let Some(rest) = uri.strip_prefix("${") else {
-        return (!uri.is_empty()).then(|| PathBuf::from(uri));
+        if uri.is_empty() {
+            return None;
+        }
+        let path = PathBuf::from(uri);
+        return Some(match kiprjmod {
+            Some(base) if path.is_relative() => base.join(path),
+            _ => path,
+        });
     };
     let close = rest.find('}')?;
     let var = &rest[..close];
     let tail = rest[close + 1..].trim_start_matches(['/', '\\']);
 
-    // ${KIPRJMOD} is the project directory — resolved from the table's own
+    // ${KIPRJMOD} is the project directory — resolved from the top-level table's
     // location, not the environment: KiCad sets it per open project at
     // runtime, so an exported value (if any) may belong to a different
     // project than the table being read. Project-scoped registrations are
@@ -1652,20 +1728,35 @@ const MAX_LIB_TABLE_DEPTH: usize = 4;
 ///
 /// Each returned entry carries the original `uri` plus a resolved `path`
 /// whenever [`expand_lib_uri`] yields one: a `${KICAD*_DIR}` URI resolves only
-/// if the expansion exists on disk, while a plain URI is passed through as
-/// written. The target may be a directory (`.pretty`) or a file
-/// (`.kicad_sym`), so the presence of `path` is not a promise that the library
-/// is readable — only that the URI was understood.
+/// if the expansion exists on disk, while a plain relative URI is anchored at
+/// the table directory and an absolute URI is unchanged. The target may be a
+/// directory (`.pretty`) or a file (`.kicad_sym`); `path` means only that the
+/// URI was understood, not that the library is readable.
 fn flatten_lib_table(
     content: &str,
     depth: usize,
     kiprjmod: Option<&Path>,
+) -> Vec<serde_json::Value> {
+    flatten_lib_table_in_dir(content, depth, kiprjmod, kiprjmod)
+}
+
+fn flatten_lib_table_in_dir(
+    content: &str,
+    depth: usize,
+    kiprjmod: Option<&Path>,
+    table_dir: Option<&Path>,
 ) -> Vec<serde_json::Value> {
     let mut out = Vec::new();
 
     for mut entry in parse_lib_table(content) {
         let uri = entry["uri"].as_str().unwrap_or("").to_string();
         let is_nested = entry["type"].as_str() == Some("Table");
+        // Plain paths follow the current table; KIPRJMOD stays at the root.
+        let base = if uri.starts_with("${") {
+            kiprjmod
+        } else {
+            table_dir
+        };
 
         if is_nested {
             if depth >= MAX_LIB_TABLE_DEPTH {
@@ -1676,14 +1767,21 @@ fn flatten_lib_table(
                 );
                 continue;
             }
-            match expand_lib_uri(&uri, kiprjmod).map(std::fs::read_to_string) {
-                Some(Ok(nested)) => out.extend(flatten_lib_table(&nested, depth + 1, kiprjmod)),
+            match expand_lib_uri(&uri, base)
+                .map(|path| std::fs::read_to_string(&path).map(|nested| (path, nested)))
+            {
+                Some(Ok((path, nested))) => out.extend(flatten_lib_table_in_dir(
+                    &nested,
+                    depth + 1,
+                    kiprjmod,
+                    path.parent(),
+                )),
                 _ => tracing::warn!("nested lib-table '{}' could not be read", uri),
             }
             continue;
         }
 
-        if let Some(path) = expand_lib_uri(&uri, kiprjmod) {
+        if let Some(path) = expand_lib_uri(&uri, base) {
             entry["path"] = json!(path.to_string_lossy());
         }
         out.push(entry);
@@ -4812,34 +4910,78 @@ async fn handle_get_footprint_info(
 
 async fn handle_search_footprints(
     args: &serde_json::Value,
-    _ctx: &ToolContext,
+    ctx: &ToolContext,
+) -> anyhow::Result<CallToolResult> {
+    handle_search_footprints_with_global_table(args, ctx, &global_fp_lib_table()).await
+}
+
+async fn handle_search_footprints_with_global_table(
+    args: &serde_json::Value,
+    ctx: &ToolContext,
+    global_table: &Path,
 ) -> anyhow::Result<CallToolResult> {
     let query = match require_str(args, "query") {
         Ok(v) => v.to_lowercase(),
         Err(e) => return Ok(e),
     };
-    let limit = args["limit"].as_u64().unwrap_or(50) as usize;
+    let limit = usize::try_from(args["limit"].as_u64().unwrap_or(50)).unwrap_or(usize::MAX);
+    let project_dir = args["project_dir"]
+        .as_str()
+        .map(PathBuf::from)
+        .or_else(|| ctx.config.project_dir.clone());
 
-    // Walk global fp-lib-table
-    let fp_lib_table_path = super::kicad_config_dir().join("fp-lib-table");
+    // Use the same table flattening and URI expansion as footprint lookup.
+    let mut libs = Vec::new();
+    if let Some(dir) = &project_dir {
+        libs.extend(read_flat_lib_table(&dir.join("fp-lib-table")));
+    }
+    libs.extend(read_flat_lib_table(global_table));
 
     let mut results = Vec::new();
-
-    'outer: for lib in read_flat_lib_table(&fp_lib_table_path) {
+    let mut seen = std::collections::HashSet::new();
+    'outer: for lib in libs {
+        if results.len() >= limit {
+            break;
+        }
         let nickname = lib["nickname"].as_str().unwrap_or("").to_string();
+        // Shadow the entire global library even if the project URI is broken
+        // or none of its footprints match. Each id can then occur only once.
+        if !seen.insert(nickname.clone()) {
+            continue;
+        }
         let Some(dir) = lib["path"].as_str().map(PathBuf::from) else {
             continue;
         };
         let Ok(mut rd) = tokio::fs::read_dir(&dir).await else {
             continue;
         };
+        let mut files = Vec::new();
         while let Ok(Some(entry)) = rd.next_entry().await {
-            let fname = entry.file_name();
-            let fname_str = fname.to_string_lossy();
-            let Some(fp_name) = fname_str.strip_suffix(".kicad_mod") else {
-                continue;
+            let path = entry.path();
+            if path.extension().is_some_and(|ext| ext == "kicad_mod") && path.is_file() {
+                files.push(path);
+            }
+        }
+        files.sort();
+        for path in files {
+            let fp_name = path.file_stem().unwrap_or_default().to_string_lossy();
+            let matches = if fp_name.to_lowercase().contains(&query) {
+                true
+            } else {
+                tokio::fs::read_to_string(&path)
+                    .await
+                    .ok()
+                    .and_then(|content| parse_sexp(&content).ok())
+                    .is_some_and(|footprint| {
+                        matches!(footprint.head(), Some("footprint" | "module"))
+                            && ["tags", "descr"].iter().any(|tag| {
+                                footprint
+                                    .find_str(tag)
+                                    .is_some_and(|value| value.to_lowercase().contains(&query))
+                            })
+                    })
             };
-            if fp_name.to_lowercase().contains(&query) {
+            if matches {
                 results.push(json!({
                     "library": nickname,
                     "name": fp_name,
@@ -5007,6 +5149,289 @@ mod tests {
             })
             .collect();
         format!("({kind}\r\n\t(version 7)\r\n{body})\r\n")
+    }
+
+    fn write_search_table(dir: &Path, entries: &[(&str, &str, &str)]) -> PathBuf {
+        std::fs::create_dir_all(dir).unwrap();
+        let table = dir.join("fp-lib-table");
+        std::fs::write(&table, kicad_style_table("fp_lib_table", entries)).unwrap();
+        table
+    }
+
+    fn write_search_footprint(dir: &Path, name: &str, description: &str, tags: &str) {
+        std::fs::create_dir_all(dir).unwrap();
+        std::fs::write(
+            dir.join(format!("{name}.kicad_mod")),
+            format!(
+                "(footprint {}\r\n\t(descr {})\r\n\t(tags\r\n\t\t{})\r\n)\r\n",
+                quote_lib_table_string(name),
+                quote_lib_table_string(description),
+                quote_lib_table_string(tags),
+            ),
+        )
+        .unwrap();
+    }
+
+    async fn search_response(
+        args: &serde_json::Value,
+        ctx: &ToolContext,
+        global_table: &Path,
+    ) -> serde_json::Value {
+        let result = handle_search_footprints_with_global_table(args, ctx, global_table)
+            .await
+            .unwrap();
+        assert!(!result.is_error, "{:?}", result.content);
+        serde_json::from_str(&result_text(&result)).unwrap()
+    }
+
+    #[tokio::test]
+    async fn search_footprints_finds_project_only_libraries_and_the_configured_default() {
+        let tmp = tempfile::tempdir().unwrap();
+        let project = tmp.path().join("project");
+        write_search_footprint(&project.join("parts.pretty"), "Solo", "", "");
+        write_search_table(&project, &[("Parts", "KiCad", "${KIPRJMOD}/parts.pretty")]);
+        let global = tmp.path().join("absent-global-fp-lib-table");
+        let mut configured = test_ctx();
+        configured.config.project_dir = Some(project.clone());
+        let expected = json!([{"library": "Parts", "name": "Solo", "id": "Parts:Solo"}]);
+        for (args, ctx) in [
+            (
+                json!({"query": "SOLO", "project_dir": project.to_string_lossy()}),
+                test_ctx(),
+            ),
+            (json!({"query": "SOLO"}), configured),
+        ] {
+            let result = search_response(&args, &ctx, &global).await;
+            assert_eq!(result["query"], "SOLO");
+            assert_eq!(result["count"], 1);
+            assert_eq!(result["results"], expected);
+        }
+        let schema = tools()
+            .into_iter()
+            .find(|tool| tool.name == "search_footprints")
+            .unwrap()
+            .input_schema;
+        assert_eq!(schema["properties"]["project_dir"]["type"], "string");
+        assert_eq!(schema["properties"]["limit"]["default"], 50);
+    }
+
+    #[tokio::test]
+    async fn search_footprints_explicit_project_wins_over_the_configured_project() {
+        let tmp = tempfile::tempdir().unwrap();
+        let default = tmp.path().join("default");
+        let explicit = tmp.path().join("explicit");
+        write_search_footprint(&default.join("parts.pretty"), "Part", "", "default-only");
+        write_search_footprint(&explicit.join("parts.pretty"), "Part", "", "explicit-only");
+        for project in [&default, &explicit] {
+            write_search_table(project, &[("Parts", "KiCad", "${KIPRJMOD}/parts.pretty")]);
+        }
+        let global = tmp.path().join("absent-global-fp-lib-table");
+        let mut ctx = test_ctx();
+        ctx.config.project_dir = Some(default);
+        let result = search_response(
+            &json!({"query": "explicit-only", "project_dir": explicit.to_string_lossy()}),
+            &ctx,
+            &global,
+        )
+        .await;
+        assert_eq!(
+            result["results"],
+            json!([{"library": "Parts", "name": "Part", "id": "Parts:Part"}])
+        );
+        let hidden = search_response(
+            &json!({"query": "default-only", "project_dir": explicit.to_string_lossy()}),
+            &ctx,
+            &global,
+        )
+        .await;
+        assert_eq!(
+            hidden["count"], 0,
+            "the configured project must not be searched too"
+        );
+    }
+
+    #[tokio::test]
+    async fn search_footprints_matches_only_structural_names_tags_and_descriptions() {
+        let tmp = tempfile::tempdir().unwrap();
+        let pretty = tmp.path().join("parts.pretty");
+        write_search_footprint(
+            &pretty,
+            "Neutral",
+            "Socket for 0.1\" pitch headers",
+            "Sensor analog",
+        );
+        std::fs::write(
+            pretty.join("Decoy.kicad_mod"),
+            r#"(footprint "Decoy"
+                (property "Note" "(tags \"sensor\") (descr \"socket\")")
+                (model "sensor.step")
+                (nested (tags "sensor") (descr "socket")))"#,
+        )
+        .unwrap();
+        std::fs::write(
+            pretty.join("Malformed.kicad_mod"),
+            "(footprint (tags \"sensor\"",
+        )
+        .unwrap();
+        std::fs::write(pretty.join("Notes.txt"), "sensor").unwrap();
+        write_search_table(
+            tmp.path(),
+            &[("Parts", "KiCad", "${KIPRJMOD}/parts.pretty")],
+        );
+        let global = tmp.path().join("absent-global-fp-lib-table");
+        for query in ["SENSOR", "0.1\" PITCH", "neuTR"] {
+            let result = search_response(
+                &json!({"query": query, "project_dir": tmp.path().to_string_lossy()}),
+                &test_ctx(),
+                &global,
+            )
+            .await;
+            assert_eq!(result["query"], query);
+            assert_eq!(
+                result["results"],
+                json!([{"library": "Parts", "name": "Neutral", "id": "Parts:Neutral"}])
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn search_footprints_shadows_whole_global_libraries_and_deduplicates_ids() {
+        let tmp = tempfile::tempdir().unwrap();
+        let project = tmp.path().join("project");
+        let config = tmp.path().join("config");
+        let global_shared = config.join("shared.pretty");
+        write_search_footprint(
+            &project.join("shared.pretty"),
+            "Common",
+            "",
+            "project-token",
+        );
+        write_search_footprint(&global_shared, "Common", "", "global-shadow-token");
+        write_search_footprint(&global_shared, "GlobalOnly", "", "global-shadow-token");
+        write_search_footprint(&config.join("global-only.pretty"), "Common", "", "");
+        write_search_footprint(&config.join("blocked.pretty"), "Ghost", "", "");
+        write_search_table(
+            &project,
+            &[
+                ("Shared", "KiCad", "shared.pretty"),
+                ("Shared", "KiCad", "shared.pretty"),
+                ("Blocked", "KiCad", "${KIPRJMOD}/missing.pretty"),
+            ],
+        );
+        let nested = config.join("nested-fp-lib-table");
+        std::fs::write(
+            &nested,
+            kicad_style_table(
+                "fp_lib_table",
+                &[
+                    ("Global", "KiCad", "global-only.pretty"),
+                    ("Global", "KiCad", "global-only.pretty"),
+                ],
+            ),
+        )
+        .unwrap();
+        let global = write_search_table(
+            &config,
+            &[
+                ("Shared", "KiCad", &global_shared.to_string_lossy()),
+                ("Blocked", "KiCad", "blocked.pretty"),
+                ("Bundled", "Table", "nested-fp-lib-table"),
+            ],
+        );
+        let mut ctx = test_ctx();
+        ctx.config.project_dir = Some(project);
+        let result = search_response(&json!({"query": ""}), &ctx, &global).await;
+        assert_eq!(result["count"], 2);
+        assert_eq!(
+            result["results"],
+            json!([
+                {"library": "Shared", "name": "Common", "id": "Shared:Common"},
+                {"library": "Global", "name": "Common", "id": "Global:Common"},
+            ])
+        );
+        for query in ["global-shadow-token", "Ghost"] {
+            assert_eq!(
+                search_response(&json!({"query": query}), &ctx, &global).await["count"],
+                0
+            );
+        }
+        let local = search_response(&json!({"query": "project-token"}), &ctx, &global).await;
+        assert_eq!(local["count"], 1);
+        assert_eq!(local["results"][0]["id"], "Shared:Common");
+    }
+
+    #[tokio::test]
+    async fn search_footprints_limit_is_a_stable_prefix_including_zero() {
+        let tmp = tempfile::tempdir().unwrap();
+        let pretty = tmp.path().join("parts.pretty");
+        for index in (0..55).rev() {
+            write_search_footprint(&pretty, &format!("Match_{index:02}"), "", "");
+        }
+        std::fs::create_dir(pretty.join("A_Directory.kicad_mod")).unwrap();
+        write_search_table(
+            tmp.path(),
+            &[("Parts", "KiCad", "${KIPRJMOD}/parts.pretty")],
+        );
+        let global = tmp.path().join("absent-global-fp-lib-table");
+        for (limit, count) in [
+            (None, 50),
+            (Some(0_u64), 0),
+            (Some(1), 1),
+            (Some(7), 7),
+            (Some(100), 55),
+            (Some(u64::MAX), 55),
+        ] {
+            let mut args = json!({"query": "", "project_dir": tmp.path().to_string_lossy()});
+            if let Some(limit) = limit {
+                args["limit"] = json!(limit);
+            }
+            let result = search_response(&args, &test_ctx(), &global).await;
+            assert_eq!(result["count"], count);
+            let hits = result["results"].as_array().unwrap();
+            assert_eq!(hits.len(), count as usize);
+            for (index, hit) in hits.iter().enumerate() {
+                assert_eq!(hit["id"], format!("Parts:Match_{index:02}"));
+                assert_eq!(
+                    hit.as_object().unwrap().len(),
+                    3,
+                    "keep the existing result keys"
+                );
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn search_footprints_uses_private_config_and_project_tables_without_env_mutation() {
+        let tmp = tempfile::tempdir().unwrap();
+        let config_home = tmp.path().join("private-config");
+        let version = config_home.join("9.0");
+        let project = tmp.path().join("project");
+        write_search_footprint(&version.join("parts.pretty"), "Global", "", "private-token");
+        write_search_footprint(&project.join("parts.pretty"), "Local", "", "private-token");
+        write_search_table(&version, &[("Private", "KiCad", "parts.pretty")]);
+        write_search_table(
+            &project,
+            &[("Project", "KiCad", "${KIPRJMOD}/parts.pretty")],
+        );
+        // A root-level table must not bypass the existing version selection.
+        write_search_table(&config_home, &[("Decoy", "KiCad", "9.0/parts.pretty")]);
+        let config = super::super::kicad_config_dir_with_home(Some(config_home.into_os_string()));
+        assert_eq!(config, version);
+        let mut ctx = test_ctx();
+        ctx.config.project_dir = Some(project);
+        let result = search_response(
+            &json!({"query": "PRIVATE-TOKEN"}),
+            &ctx,
+            &config.join("fp-lib-table"),
+        )
+        .await;
+        assert_eq!(
+            result["results"],
+            json!([
+                {"library": "Project", "name": "Local", "id": "Project:Local"},
+                {"library": "Private", "name": "Global", "id": "Private:Global"},
+            ])
+        );
     }
 
     /// Serializes tests that set KICAD10_FOOTPRINT_DIR (process-wide env), the
@@ -5273,6 +5698,49 @@ mod tests {
             Some(leaf_dir),
             "resolved path missing"
         );
+    }
+
+    #[test]
+    fn nested_relative_tables_and_libraries_keep_the_original_kiprjmod() {
+        let tmp = tempfile::tempdir().unwrap();
+        let nested = tmp.path().join("tables");
+        let deeper = nested.join("deeper");
+        let expected = [
+            ("NestedLocal", nested.join("parts.pretty")),
+            ("NestedProject", tmp.path().join("project.pretty")),
+            ("DeepLocal", deeper.join("parts.pretty")),
+            ("DeepProject", tmp.path().join("project.pretty")),
+        ];
+        for (_, path) in &expected {
+            std::fs::create_dir_all(path).unwrap();
+        }
+        write_search_table(
+            &deeper,
+            &[
+                ("DeepLocal", "KiCad", "parts.pretty"),
+                ("DeepProject", "KiCad", "${KIPRJMOD}/project.pretty"),
+            ],
+        );
+        write_search_table(
+            &nested,
+            &[
+                ("NestedLocal", "KiCad", "parts.pretty"),
+                ("NestedProject", "KiCad", "${KIPRJMOD}/project.pretty"),
+                ("Deeper", "Table", "deeper/fp-lib-table"),
+            ],
+        );
+        let table = write_search_table(tmp.path(), &[("Nested", "Table", "tables/fp-lib-table")]);
+
+        let libs = read_lib_table_checked(&table).unwrap();
+        assert_eq!(
+            libs.len(),
+            expected.len(),
+            "nested relative table was not followed"
+        );
+        for (lib, (nickname, path)) in libs.iter().zip(expected) {
+            assert_eq!(lib["nickname"], nickname);
+            assert_eq!(lib["path"].as_str().map(PathBuf::from), Some(path));
+        }
     }
 
     #[test]
@@ -6336,6 +6804,7 @@ mod tests {
             y,
             w,
             h,
+            rotation: 0.0,
         }
     }
 
@@ -6350,6 +6819,160 @@ mod tests {
         assert!((max_x - 1.2).abs() < 1e-9);
         assert!((min_y - -0.3).abs() < 1e-9);
         assert!((max_y - 0.3).abs() < 1e-9);
+    }
+
+    fn graphics_footprint(args: &serde_json::Value, pads: &[PadGeom]) -> SexpNode {
+        parse_sexp(&format!(
+            "(footprint \"Test\"{})",
+            build_footprint_graphics(args, "Test", pads)
+        ))
+        .unwrap()
+    }
+
+    fn outline_bounds(footprint: &SexpNode, layer: &str) -> (f64, f64, f64, f64) {
+        let outline = footprint
+            .children()
+            .unwrap()
+            .iter()
+            .find(|node| {
+                matches!(node.head(), Some("fp_rect" | "fp_poly"))
+                    && node.find_str("layer") == Some(layer)
+            })
+            .unwrap();
+        let points = if let Some(pts) = outline.find("pts") {
+            pts.find_all("xy")
+        } else {
+            vec![outline.find("start").unwrap(), outline.find("end").unwrap()]
+        };
+        points.into_iter().fold(
+            (
+                f64::INFINITY,
+                f64::INFINITY,
+                f64::NEG_INFINITY,
+                f64::NEG_INFINITY,
+            ),
+            |(min_x, min_y, max_x, max_y), point| {
+                let x = point.get_f64(1).unwrap();
+                let y = point.get_f64(2).unwrap();
+                (min_x.min(x), min_y.min(y), max_x.max(x), max_y.max(y))
+            },
+        )
+    }
+
+    #[test]
+    fn courtyard_contains_a_body_larger_than_pads() {
+        let pads = [
+            pad("1", "smd", -1.0, 0.0, 0.4, 0.6),
+            pad("2", "smd", 1.0, 0.0, 0.4, 0.6),
+        ];
+        let footprint = graphics_footprint(
+            &json!({"body_width": 4.0, "body_height": 3.0, "courtyard_clearance": 0.25}),
+            &pads,
+        );
+        assert_eq!(
+            outline_bounds(&footprint, "F.CrtYd"),
+            (-2.25, -1.75, 2.25, 1.75)
+        );
+        assert_eq!(outline_bounds(&footprint, "F.Fab"), (-2.0, -1.5, 2.0, 1.5));
+        assert_eq!(
+            outline_bounds(&footprint, "F.SilkS"),
+            (-1.35, -0.45, 1.35, 0.45)
+        );
+        assert_eq!(
+            footprint.find_all("fp_circle"),
+            graphics_footprint(&json!({}), &pads).find_all("fp_circle"),
+            "the courtyard fix must not change the silk pin-1 marker"
+        );
+    }
+
+    #[test]
+    fn courtyard_keeps_pads_larger_than_the_body() {
+        let pads = [
+            pad("1", "smd", -3.0, 0.0, 2.0, 2.0),
+            pad("2", "smd", 3.0, 0.0, 2.0, 2.0),
+        ];
+        let footprint = graphics_footprint(
+            &json!({"body_width": 2.0, "body_height": 1.0, "courtyard_clearance": 0.5}),
+            &pads,
+        );
+        assert_eq!(
+            outline_bounds(&footprint, "F.CrtYd"),
+            (-4.5, -1.5, 4.5, 1.5)
+        );
+        assert_eq!(outline_bounds(&footprint, "F.Fab"), (-1.0, -0.5, 1.0, 0.5));
+    }
+
+    #[test]
+    fn courtyard_unions_each_axis_without_recentering_an_asymmetric_body() {
+        let mut pads = [
+            pad("1", "smd", -3.0, 1.0, 2.0, 2.0),
+            pad("2", "smd", 4.0, 5.0, 4.0, 2.0),
+        ];
+        let args = json!({"body_width": 6.0, "body_height": 12.0, "courtyard_clearance": 0.4});
+        let nominal = graphics_footprint(&args, &pads);
+        assert_eq!(outline_bounds(&nominal, "F.CrtYd"), (-4.4, -3.4, 6.4, 9.4));
+        assert_eq!(outline_bounds(&nominal, "F.Fab"), (-2.0, -3.0, 4.0, 9.0));
+
+        pads[1].rotation = 90.0;
+        let rotated = graphics_footprint(&args, &pads);
+        assert_eq!(outline_bounds(&rotated, "F.CrtYd"), (-4.4, -3.4, 5.4, 9.4));
+        assert_eq!(rotated.find_all("fp_poly"), nominal.find_all("fp_poly"));
+        assert_eq!(rotated.find_all("fp_circle"), nominal.find_all("fp_circle"));
+        assert_eq!(
+            outline_bounds(&rotated, "F.SilkS"),
+            outline_bounds(&nominal, "F.SilkS")
+        );
+    }
+
+    #[test]
+    fn courtyard_accounts_for_quarter_and_oblique_pad_rotations_without_a_body() {
+        let mut pads = [pad("1", "smd", 3.0, -2.0, 6.0, 2.0)];
+        for angle in [90.0, -90.0, 450.0] {
+            pads[0].rotation = angle;
+            let footprint = graphics_footprint(&json!({"courtyard_clearance": 0.25}), &pads);
+            assert_eq!(
+                outline_bounds(&footprint, "F.CrtYd"),
+                (1.75, -5.25, 4.25, 1.25)
+            );
+        }
+        pads[0].w = 4.0;
+        pads[0].rotation = 45.0;
+        let (min_x, min_y, max_x, max_y) = rotated_pads_bbox(&pads);
+        let half_extent = 3.0 / 2.0_f64.sqrt();
+        assert!((min_x - (3.0 - half_extent)).abs() < 1e-9);
+        assert!((min_y - (-2.0 - half_extent)).abs() < 1e-9);
+        assert!((max_x - (3.0 + half_extent)).abs() < 1e-9);
+        assert!((max_y - (-2.0 + half_extent)).abs() < 1e-9);
+        let footprint = graphics_footprint(&json!({"courtyard_clearance": 0.25}), &pads);
+        assert_eq!(
+            outline_bounds(&footprint, "F.CrtYd"),
+            (0.6287, -4.3713, 5.3713, 0.3713)
+        );
+    }
+
+    #[test]
+    fn no_body_keeps_legacy_outlines_and_partial_body_fallback() {
+        let pads = [
+            pad("1", "smd", -1.0, 0.0, 0.4, 0.6),
+            pad("2", "smd", 1.0, 0.0, 0.4, 0.6),
+        ];
+        let footprint = graphics_footprint(&json!({}), &pads);
+        assert_eq!(
+            outline_bounds(&footprint, "F.CrtYd"),
+            (-1.45, -0.55, 1.45, 0.55)
+        );
+        assert_eq!(outline_bounds(&footprint, "F.Fab"), (-1.2, -0.3, 1.2, 0.3));
+        for args in [json!({"body_width": 20.0}), json!({"body_height": 20.0})] {
+            assert_eq!(graphics_footprint(&args, &pads), footprint);
+        }
+        assert_eq!(
+            outline_bounds(
+                &graphics_footprint(&json!({"courtyard_clearance": 0.0}), &pads),
+                "F.CrtYd"
+            ),
+            pads_bbox(&pads),
+            "zero clearance is a valid explicit override"
+        );
     }
 
     #[test]
@@ -6649,6 +7272,112 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn create_footprint_serves_the_body_and_rotated_pad_courtyard() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("Union.kicad_mod");
+        let ctx = Arc::new(test_ctx());
+        let create = tools()
+            .into_iter()
+            .find(|tool| tool.name == "create_footprint")
+            .unwrap();
+        let result = (create.handler)(
+            &json!({
+                "output": path.to_string_lossy(), "name": "Union",
+                "body_width": 6.0, "body_height": 12.0, "courtyard_clearance": 0.4,
+                "pads": [
+                    {"number":"1", "type":"smd", "shape":"rect", "x":-3.0, "y":1.0, "width":2.0, "height":2.0},
+                    {"number":"2", "type":"smd", "shape":"rect", "x":4.0, "y":5.0, "width":4.0, "height":2.0, "rotation":90.0}
+                ]
+            }),
+            ctx.clone(),
+        ).await.unwrap();
+        assert!(!result.is_error, "{:?}", result.content);
+        let content = std::fs::read_to_string(&path).unwrap();
+        let footprint = parse_sexp(&content).unwrap();
+        assert_eq!(
+            outline_bounds(&footprint, "F.CrtYd"),
+            (-4.4, -3.4, 5.4, 9.4)
+        );
+        assert_eq!(outline_bounds(&footprint, "F.Fab"), (-2.0, -3.0, 4.0, 9.0));
+        assert_eq!(
+            footprint.find_all("pad")[1].find("at").unwrap().get_f64(3),
+            Some(90.0)
+        );
+
+        let inspect = tools()
+            .into_iter()
+            .find(|tool| tool.name == "get_footprint_info")
+            .unwrap();
+        let served = (inspect.handler)(
+            &json!({"footprint_path": path.to_string_lossy(), "graphics_layer": "F.CrtYd"}),
+            ctx,
+        )
+        .await
+        .unwrap();
+        assert!(!served.is_error, "{:?}", served.content);
+        let served: serde_json::Value = serde_json::from_str(&result_text(&served)).unwrap();
+        assert_eq!(served["has_courtyard"], true);
+        assert_eq!(served["graphic_count"], 1);
+        assert_eq!(
+            served["graphics"][0]["start"],
+            json!({"x": -4.4, "y": -3.4})
+        );
+        assert_eq!(served["graphics"][0]["end"], json!({"x": 5.4, "y": 9.4}));
+        assert_eq!(served["graphics"][0]["stroke_width_mm"], 0.05);
+    }
+
+    #[tokio::test]
+    async fn create_footprint_refuses_invalid_dimensions_and_clearance_before_writing() {
+        let tmp = tempfile::tempdir().unwrap();
+        let existing = tmp.path().join("Existing.kicad_mod");
+        let absent = tmp.path().join("uncreated").join("New.kicad_mod");
+        let original = b"(footprint \"Existing\"\r\n\t(layer \"F.Cu\")\r\n)\r\n";
+        std::fs::write(&existing, original).unwrap();
+        for (field, value) in [
+            ("body_width", json!(0)),
+            ("body_width", json!(-1)),
+            ("body_height", json!(0)),
+            ("body_height", json!(-1)),
+            ("body_width", json!("large")),
+            ("body_height", json!(null)),
+            ("courtyard_clearance", json!(-0.1)),
+            ("courtyard_clearance", json!("wide")),
+            ("courtyard_clearance", json!(null)),
+            ("pads[0].width", json!(0)),
+            ("pads[0].width", json!(-1)),
+            ("pads[0].width", json!("wide")),
+            ("pads[0].height", json!(0)),
+            ("pads[0].height", json!(-1)),
+            ("pads[0].height", json!(null)),
+            ("pads[0].rotation", json!("ninety")),
+            ("pads[0].rotation", json!(null)),
+        ] {
+            for path in [&existing, &absent] {
+                let mut args = json!({
+                    "output": path.to_string_lossy(), "name": "Replacement",
+                    "body_width": 4.0, "body_height": 3.0,
+                    "pads": [{"number":"1", "type":"smd", "shape":"rect", "x":0.0, "y":0.0, "width":1.0, "height":1.0}]
+                });
+                if let Some(pad_field) = field.strip_prefix("pads[0].") {
+                    args["pads"][0][pad_field] = value.clone();
+                } else {
+                    args[field] = value.clone();
+                }
+                let result = handle_create_footprint(&args, &test_ctx()).await.unwrap();
+                assert!(result.is_error, "{field}={value} must be refused");
+                let error: serde_json::Value = serde_json::from_str(&result_text(&result)).unwrap();
+                assert_eq!(error["error"]["kind"], "invalid_argument");
+                assert_eq!(error["error"]["field"], field);
+                assert_eq!(std::fs::read(&existing).unwrap(), original);
+                assert!(
+                    !absent.parent().unwrap().exists(),
+                    "a refused call must not create directories"
+                );
+            }
+        }
+    }
+
     #[test]
     fn create_footprint_schema_exposes_pad_layers_rotation_and_roundrect_ratio() {
         let tool = tools()
@@ -6659,6 +7388,20 @@ mod tests {
         assert_eq!(pad_properties["layers"]["items"]["type"], json!("string"));
         assert_eq!(pad_properties["rotation"]["type"], json!("number"));
         assert_eq!(pad_properties["roundrect_rratio"]["maximum"], json!(0.5));
+        assert_eq!(pad_properties["width"]["exclusiveMinimum"], json!(0));
+        assert_eq!(pad_properties["height"]["exclusiveMinimum"], json!(0));
+        assert_eq!(
+            tool.input_schema["properties"]["body_width"]["exclusiveMinimum"],
+            json!(0)
+        );
+        assert_eq!(
+            tool.input_schema["properties"]["body_height"]["exclusiveMinimum"],
+            json!(0)
+        );
+        assert_eq!(
+            tool.input_schema["properties"]["courtyard_clearance"]["minimum"],
+            json!(0)
+        );
     }
 
     #[tokio::test]

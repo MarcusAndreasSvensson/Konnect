@@ -1614,10 +1614,16 @@ mod arg_helper_tests {
 
 // ─── KiCAD config directory detection ────────────────────────────────────────
 
-/// Find the KiCAD user config directory by probing for installed version directories.
-/// Checks versions in descending order: 10.0, 9.0, 8.0, then bare "kicad".
+/// Find the KiCAD user config directory under `KICAD_CONFIG_HOME`, when set,
+/// otherwise the platform config root. Probe versions in descending order.
 pub fn kicad_config_dir() -> std::path::PathBuf {
-    let base = kicad_config_base();
+    kicad_config_dir_with_home(std::env::var_os("KICAD_CONFIG_HOME"))
+}
+
+fn kicad_config_dir_with_home(config_home: Option<std::ffi::OsString>) -> std::path::PathBuf {
+    let base = config_home
+        .map(std::path::PathBuf::from)
+        .unwrap_or_else(kicad_config_base);
     let versions = ["10.0", "9.0", "8.0"];
     for ver in &versions {
         let dir = base.join(ver);
@@ -1625,7 +1631,7 @@ pub fn kicad_config_dir() -> std::path::PathBuf {
             return dir;
         }
     }
-    // Fallback: bare kicad dir or 10.0 (will be created on first use)
+    // Preserve the existing default for a root with no version directories.
     base.join("10.0")
 }
 
@@ -1648,6 +1654,55 @@ fn kicad_config_base() -> std::path::PathBuf {
     {
         let home = std::env::var("HOME").unwrap_or_default();
         std::path::PathBuf::from(home).join(".config").join("kicad")
+    }
+}
+
+#[cfg(test)]
+mod kicad_config_dir_tests {
+    use super::*;
+
+    #[test]
+    fn config_home_override_uses_the_existing_version_order() {
+        let root = tempfile::tempdir().unwrap();
+        std::fs::create_dir(root.path().join("8.0")).unwrap();
+        std::fs::create_dir(root.path().join("9.0")).unwrap();
+        // A file is not a usable version directory.
+        std::fs::write(root.path().join("10.0"), "not a directory").unwrap();
+        let home = Some(root.path().as_os_str().to_owned());
+        assert_eq!(
+            kicad_config_dir_with_home(home.clone()),
+            root.path().join("9.0")
+        );
+
+        std::fs::remove_file(root.path().join("10.0")).unwrap();
+        std::fs::create_dir(root.path().join("10.0")).unwrap();
+        assert_eq!(kicad_config_dir_with_home(home), root.path().join("10.0"));
+    }
+
+    #[test]
+    fn an_empty_config_home_keeps_the_default_without_creating_it() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().join("private-config");
+        assert_eq!(
+            kicad_config_dir_with_home(Some(root.as_os_str().to_owned())),
+            root.join("10.0")
+        );
+        assert!(!root.exists(), "config detection must remain read-only");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn config_home_override_preserves_non_unicode_paths() {
+        use std::os::unix::ffi::OsStringExt;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().join(std::ffi::OsString::from_vec(vec![0xff]));
+        // macOS filesystems reject non-Unicode names; path detection itself
+        // must still preserve the supplied OS string without creating it.
+        assert_eq!(
+            kicad_config_dir_with_home(Some(root.clone().into_os_string())),
+            root.join("10.0")
+        );
     }
 }
 
