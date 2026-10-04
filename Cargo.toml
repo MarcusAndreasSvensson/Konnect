@@ -102,3 +102,11 @@ konnect-core = { path = "crates/konnect-core" }
 konnect-schematic-editor = { path = "crates/konnect-schematic-editor" }
 konnect-render = { path = "crates/konnect-render" }
 konnect-vcs = { path = "crates/konnect-vcs" }
+
+# The S-expression parser is ~25x slower unoptimized. The installed-demo
+# tests parse 185 MB of KiCad boards, and debug servers parse real boards.
+[profile.dev.package.konnect-sexp]
+opt-level = 3
+
+[profile.dev.package.nom]
+opt-level = 3
