@@ -89,6 +89,32 @@ footprints 5 mm to the right of it. It used to stage them beside the page origin
 and therefore `plan_revision`, differ from plans computed before this change.
 Apply already requires a fresh dry run.
 
+## Unreleased: `check_freerouting` reports where it searched (minor release)
+
+The `jar_path` argument of `check_freerouting` and `route_specctra_dsn` was
+described as "uses config default", but no Freerouting setting exists. Both
+descriptions now list where discovery looks, in order: the directories named
+by `KICAD10_3RD_PARTY`, `KICAD9_3RD_PARTY` and `KICAD8_3RD_PARTY`; the KiCad
+10.0, 9.0 and 8.0 plugin folders `$HOME/Documents/KiCad/<version>/3rdparty/plugins`,
+`$HOME/.local/share/kicad/<version>/3rdparty/plugins` and, on Windows,
+`$USERPROFILE/Documents/KiCad/<version>/3rdparty/plugins`; `freerouting.jar` in
+the server's working directory; `/usr/local/lib/freerouting` and
+`/opt/freerouting`; then every directory on `PATH`. The search and both
+descriptions are built from the same table of places, and the search itself is
+unchanged.
+
+When nothing is found, `check_freerouting` adds `searched_locations`: one
+entry per location visited, with `kind`, `location_path`, `max_depth` and
+`exists`, read from the server's own environment. `location_path` is always
+absolute: a relative value from the environment is reported against the
+server's working directory, where the search reads it. A location reached twice, such as the
+`Documents` plugin folders when `HOME` and `USERPROFILE` are the same
+directory, is searched once. When `jar_path` is passed and is not a file, it
+reports `checked_path` and says so instead of giving download advice.
+`route_specctra_dsn` now refuses such a `jar_path` with `file_not_found` naming
+the path, where it used to answer "install Freerouting or pass jar_path"
+(#787).
+
 ## Unreleased: `konnect init` refreshes stale Claude hook matchers (patch release)
 
 A hook's `matcher` is built from the tool registry, so it changes when a board
