@@ -84,6 +84,13 @@ documentation-only changes may say not applicable. This is a design review
 signal, not a new requirement to redesign a subsystem or migrate unrelated
 legacy behavior before landing a focused fix.
 
+Keep the proposed solution proportionate to the demonstrated problem. Follow
+[proportionate scope review](GOVERNANCE.md#proportionate-scope-review) when a
+fix would grow into speculative edge-case handling or a broader subsystem.
+`status:needs-scope-review` asks a maintainer to settle that boundary, not a
+contributor to implement every variation. A narrow safe fix can remain separate
+from deferred expansion.
+
 When changing a tool's behavior, follow the
 [reliability contract](docs/RELIABILITY_CONTRACT.md) and complete the affected
 behavior table in the PR template. It covers input/default handling, target and
