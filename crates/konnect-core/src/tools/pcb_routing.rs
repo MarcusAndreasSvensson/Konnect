@@ -233,7 +233,9 @@ pub fn tools() -> Vec<ToolDef> {
             "Create or update a netclass in the project's design rules. Writes \
              net_settings in the sibling .kicad_pro (where KiCad keeps netclasses \
              since v7); the board file is never touched. Requires the project file \
-             to exist. An update changes only the settings you name. To see what a \
+             to exist. Refuses while KiCad holds the board open, because KiCad's next \
+             save rewrites the project file from its own copy. An update changes only \
+             the settings you name. To see what a \
              class holds, call get_netclasses rather than this tool: naming a class \
              that does not exist here creates it with the defaults, so a call meant \
              as a look writes one instead — and its result is nearly \
@@ -291,7 +293,9 @@ pub fn tools() -> Vec<ToolDef> {
             "assign_net_to_class",
             "Assign a net to an existing netclass, as a netclass_patterns entry in \
              the sibling .kicad_pro. The class must already exist (create_netclass). \
-             Reassigning moves the net's entry to the new class.",
+             Reassigning moves the net's entry to the new class. Refuses while KiCad \
+             holds the board open, because KiCad's next save rewrites the project \
+             file from its own copy.",
             json!({
                 "type": "object",
                 "properties": {
@@ -1312,6 +1316,19 @@ fn load_project_settings(
     Ok(Ok((pro, settings)))
 }
 
+/// The netclass writers' guard. Saving the board in KiCad also rewrites the
+/// project file from KiCad's own copy, so a netclass edit made here while it
+/// holds the board is reported and then silently reverted (#791). It runs
+/// before the read as well as the write: while KiCad holds the board, the
+/// file can be older than what KiCad holds, so even an answer that changes
+/// nothing would come from a stale copy.
+async fn refuse_while_kicad_holds_the_board(
+    ctx: &ToolContext,
+    board_path: &std::path::Path,
+) -> anyhow::Result<Option<CallToolResult>> {
+    crate::tools::pcb_board::refuse_if_board_open_in_kicad(ctx, board_path, "netclass change").await
+}
+
 fn save_project_settings(
     pro: &std::path::Path,
     settings: &serde_json::Value,
@@ -1361,13 +1378,16 @@ fn kicad_default_class() -> serde_json::Value {
 
 async fn handle_create_netclass(
     args: &serde_json::Value,
-    _ctx: &ToolContext,
+    ctx: &ToolContext,
 ) -> anyhow::Result<CallToolResult> {
     let board_path = get_path(args, "board")?;
     let name = match require_str(args, "name") {
         Ok(v) => v.to_string(),
         Err(e) => return Ok(e),
     };
+    if let Some(refusal) = refuse_while_kicad_holds_the_board(ctx, &board_path).await? {
+        return Ok(refusal);
+    }
     // KiCad's key, this tool's argument name, and the value a *new* class
     // takes when the caller says nothing. The defaults belong to creation
     // only: folding them in before an update turned "widen HV's track" into a
@@ -1793,7 +1813,7 @@ async fn handle_get_netclasses(
 
 async fn handle_assign_net_to_class(
     args: &serde_json::Value,
-    _ctx: &ToolContext,
+    ctx: &ToolContext,
 ) -> anyhow::Result<CallToolResult> {
     let board_path = get_path(args, "board")?;
     let net_name = match require_str(args, "net_name") {
@@ -1804,6 +1824,9 @@ async fn handle_assign_net_to_class(
         Ok(v) => v.to_string(),
         Err(e) => return Ok(e),
     };
+    if let Some(refusal) = refuse_while_kicad_holds_the_board(ctx, &board_path).await? {
+        return Ok(refusal);
+    }
 
     let (pro, mut settings) = match load_project_settings(&board_path)? {
         Ok(v) => v,

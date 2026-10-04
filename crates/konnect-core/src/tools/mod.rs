@@ -31,6 +31,8 @@ pub(crate) mod pcb_sync;
 mod placed_footprint_models;
 pub mod placement;
 pub mod project;
+#[cfg(test)]
+mod project_file_writer_tests;
 pub mod sch_analysis;
 pub(crate) mod sch_annotate;
 pub mod sch_batch;

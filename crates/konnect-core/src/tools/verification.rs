@@ -48,7 +48,9 @@ pub fn tools() -> Vec<ToolDef> {
         ),
         tool!(
             "set_design_rules",
-            "Set board-level design rules (clearance, trace width, via size) in the sibling KiCAD project file.",
+            "Set board-level design rules (clearance, trace width, via size) in the sibling KiCAD \
+             project file. Refuses while KiCad holds the board open, because KiCad's next save \
+             rewrites the project file from its own copy.",
             json!({
                 "type": "object",
                 "properties": {
@@ -423,9 +425,17 @@ fn layer_rule(name: &str, constraint: &str, value: f64, layer: &str) -> String {
 
 async fn handle_set_design_rules(
     args: &serde_json::Value,
-    _ctx: &ToolContext,
+    ctx: &ToolContext,
 ) -> anyhow::Result<CallToolResult> {
     let board = get_path(args, "board")?;
+    // KiCad rewrites the project file from memory when it saves the board, so
+    // a rule written here while it holds the board is reverted (#791). Asked
+    // before the read too: the file can be older than what KiCad holds.
+    if let Some(refusal) =
+        crate::tools::pcb_board::refuse_if_board_open_in_kicad(ctx, &board, "design rule").await?
+    {
+        return Ok(refusal);
+    }
     let project_path = sibling_project_path(&board);
     let project_content = tokio::fs::read_to_string(&project_path).await?;
     let mut project: serde_json::Value = serde_json::from_str(&project_content)?;

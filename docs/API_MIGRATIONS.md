@@ -3,6 +3,23 @@
 Konnect's tool schemas are public API. This file records intentional argument
 removals and the supported replacement workflow.
 
+## Unreleased: project-file writers refuse while KiCad holds the board (patch release)
+
+`set_design_rules`, `create_netclass` and `assign_net_to_class` edit the
+board's sibling `.kicad_pro`. When KiCad saves a board it holds, it rewrites
+that file from its own copy. So an edit made while KiCad held the board was
+reported as a success and then reverted on KiCad's next save, with no warning.
+On KiCad 10.0.5, all three values went back as soon as `run_drc` with
+`sync_live_board` saved the board.
+
+All three tools now run the check `set_predefined_sizes` already runs. While
+KiCad holds the board, they refuse and leave the project file untouched. The
+check comes before the file is read as well as before it is written, so a call
+that would change nothing is refused too: while KiCad holds the board, the file
+can be older than what KiCad holds. Close the board in KiCad, or make the
+change there, and retry. A KiCad that holds a different board, or none, does
+not affect these tools. Response shapes are unchanged (#791).
+
 ## Unreleased: grid-snapped coordinates are written as KiCad writes them (patch release)
 
 A point snapped to the 1.27 mm grid is now rounded to the six decimals KiCad
