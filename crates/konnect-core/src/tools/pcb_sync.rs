@@ -10,6 +10,7 @@ use std::path::{Path, PathBuf};
 use crate::mcp::protocol::{CallToolResult, ToolContent};
 use crate::tools::{
     pcb_board::{attempt_ipc_write, BoardWrite},
+    pcb_footprint_update::{build_import_instance, parse_library_footprint, LibraryFootprint},
     ToolContext,
 };
 use anyhow::{bail, Context, Result};
@@ -84,6 +85,7 @@ struct DesignComponent {
     footprint_id: String,
     symbol_path: String,
     dnp: bool,
+    fields: BTreeMap<String, String>,
     pad_nets: BTreeMap<String, String>,
 }
 
@@ -108,6 +110,7 @@ struct BoardFootprint {
     value: String,
     footprint_id: String,
     symbol_path: Option<String>,
+    fields: BTreeMap<String, String>,
     pad_nets: BTreeMap<String, String>,
     /// Every pad the live footprint has, netted or not. `pad_nets` holds only
     /// pads that carry a net, so it cannot answer whether a pad exists.
@@ -173,6 +176,7 @@ enum PlannedChange {
         footprint_id: String,
         symbol_path: String,
         dnp: bool,
+        fields: BTreeMap<String, String>,
         pad_nets: BTreeMap<String, String>,
         position: Point,
     },
@@ -182,6 +186,7 @@ enum PlannedChange {
         value: String,
         symbol_path: String,
         dnp: bool,
+        fields: BTreeMap<String, String>,
         pad_nets: BTreeMap<String, String>,
         preserve: PreservedBoardState,
     },
@@ -224,9 +229,7 @@ struct LiveSnapshot {
 
 #[derive(Debug)]
 struct PreparedFootprint {
-    pads: Vec<konnect_ipc::IpcPadDefinition>,
-    graphics: Vec<konnect_ipc::IpcGraphicDefinition>,
-    fields: konnect_ipc::IpcFieldPlacement,
+    library: LibraryFootprint,
     width: f64,
     height: f64,
 }
@@ -330,7 +333,7 @@ pub(crate) async fn handle_update_pcb_from_schematic(
                 return Ok(sync_response(&plan, "conflict", hierarchy.len(), false));
             }
             restage_additions(&mut plan, &prepared, snapshot.state.bounds);
-            refresh_revision_with_staging(&mut plan);
+            refresh_revision_with_staging(&mut plan, &prepared);
 
             if dry_run || plan.status == PlanStatus::Conflict {
                 let status = match plan.status {
@@ -345,7 +348,7 @@ pub(crate) async fn handle_update_pcb_from_schematic(
                 plan.counts.conflicts.planned += 1;
                 plan.diagnostics.push(conflict(
                     "stale_plan_revision",
-                    "The live board or saved schematic changed; rerun dry run and apply its new plan revision."
+                    "The live board, saved schematic or footprint library changed; rerun dry run and apply its new plan revision."
                         .to_string(),
                     None,
                 ));
@@ -358,14 +361,17 @@ pub(crate) async fn handle_update_pcb_from_schematic(
 
             let (creates, updates) = build_mutation_items(&plan, &prepared, &snapshot)?;
             // What we are about to send, so the board can be held to it.
-            let expected = footprint_shapes(creates.iter().chain(updates.iter()));
+            let expected = footprint_readback(creates.iter().chain(updates.iter()))?;
             client.run_commit_recovering_in(snapshot.document.clone(), "Update PCB from saved schematic", |client| {
                 create_sync_items_in(client, &snapshot.document, &creates)?;
                 client.update_items_in(snapshot.document.clone(), updates)?;
                 Ok(())
             })?;
-            for detail in verify_board_matches_what_was_sent(client, &snapshot.document, &expected)?
-            {
+            let verification = match verify_committed_footprints(client, &snapshot.document, &expected) {
+                Ok(details) => details,
+                Err(result) => return Ok(result),
+            };
+            for detail in verification {
                 plan.diagnostics.push(conflict(
                     "board_readback_differs",
                     format!(
@@ -697,6 +703,7 @@ fn plan_sync(netlist_source: &str, design: &ExportedDesign, board: &BoardState) 
                 footprint_id: component.footprint_id.clone(),
                 symbol_path: component.symbol_path.clone(),
                 dnp: component.dnp,
+                fields: component.fields.clone(),
                 pad_nets: component.pad_nets.clone(),
                 position,
             });
@@ -787,6 +794,10 @@ fn plan_sync(netlist_source: &str, design: &ExportedDesign, board: &BoardState) 
             || footprint.value != component.value
             || footprint.symbol_path.as_deref() != Some(component.symbol_path.as_str())
             || footprint.dnp != component.dnp
+            || component
+                .fields
+                .iter()
+                .any(|(name, value)| footprint.fields.get(name) != Some(value))
             || changed_pads > 0;
         if needs_update {
             changes.push(PlannedChange::Update {
@@ -795,6 +806,7 @@ fn plan_sync(netlist_source: &str, design: &ExportedDesign, board: &BoardState) 
                 value: component.value.clone(),
                 symbol_path: component.symbol_path.clone(),
                 dnp: component.dnp,
+                fields: component.fields.clone(),
                 pad_nets: component.pad_nets.clone(),
                 preserve: PreservedBoardState {
                     position: footprint.position,
@@ -979,6 +991,7 @@ fn plan_revision(netlist_source: &str, board: &BoardState) -> String {
         hasher.update(footprint.reference.as_bytes());
         hasher.update(footprint.footprint_id.as_bytes());
         hasher.update(footprint.symbol_path.as_deref().unwrap_or("").as_bytes());
+        hasher.update(serde_json::to_vec(&footprint.fields).expect("footprint fields serialize"));
         for (pad, net) in &footprint.pad_nets {
             hasher.update(pad.as_bytes());
             hasher.update(net.as_bytes());
@@ -991,10 +1004,17 @@ fn plan_revision(netlist_source: &str, board: &BoardState) -> String {
     format!("{:x}", hasher.finalize())
 }
 
-fn refresh_revision_with_staging(plan: &mut SyncPlan) {
+fn refresh_revision_with_staging(
+    plan: &mut SyncPlan,
+    prepared: &BTreeMap<String, PreparedFootprint>,
+) {
     let mut hasher = Sha256::new();
     hasher.update(plan.plan_revision.as_bytes());
     hasher.update(serde_json::to_vec(&plan.changes).expect("planned changes serialize"));
+    for (library_id, part) in prepared {
+        hasher.update(serde_json::to_vec(library_id).expect("library ID serializes"));
+        hasher.update(part.library.source_digest);
+    }
     plan.plan_revision = format!("{:x}", hasher.finalize());
 }
 
@@ -1038,6 +1058,8 @@ fn parse_exported_netlist(source: &str) -> Result<ExportedDesign> {
         });
 
         let value = required_value(component_node, "value")?;
+        let fields = parse_component_fields(component_node)
+            .with_context(|| format!("component {reference} has invalid schematic fields"))?;
         // kicad-cli writes no `(footprint …)` node at all for a symbol whose
         // Footprint property is empty — only a bare `(field (name
         // "Footprint"))`. That is a legitimate state (a generic `Device:R`
@@ -1072,6 +1094,7 @@ fn parse_exported_netlist(source: &str) -> Result<ExportedDesign> {
             footprint_id,
             symbol_path,
             dnp,
+            fields,
             pad_nets: BTreeMap::new(),
         });
     }
@@ -1113,6 +1136,84 @@ fn parse_exported_netlist(source: &str) -> Result<ExportedDesign> {
     })
 }
 
+/// KiCad's export puts the value at index 2, not in a `(value ...)` node.
+/// A bare `(field (name "Datasheet"))` explicitly requests an empty value.
+fn parse_component_fields(component: &SexpNode) -> Result<BTreeMap<String, String>> {
+    let mut fields = BTreeMap::new();
+    let sections = component.find_all("fields");
+    if sections.len() > 1 {
+        bail!("schematic component has more than one fields section");
+    }
+    if let Some(section) = sections.first() {
+        for field in section.children().unwrap_or_default().iter().skip(1) {
+            let children = field.children().context("schematic field is not a list")?;
+            if field.head() != Some("field") || !(2..=3).contains(&children.len()) {
+                bail!("malformed schematic field");
+            }
+            let name_node = field.get(1).context("schematic field has no name")?;
+            if name_node.head() != Some("name")
+                || name_node.children().map(|children| children.len()) != Some(2)
+            {
+                bail!("malformed schematic field name");
+            }
+            let name = name_node
+                .get(1)
+                .and_then(SexpNode::as_str)
+                .filter(|name| !name.trim().is_empty())
+                .context("schematic field has no scalar, non-empty name")?;
+            let value = match field.get(2) {
+                Some(value) => value
+                    .as_str()
+                    .context("schematic field value is not a scalar")?,
+                None => "",
+            };
+            if fields.insert(name.to_string(), value.to_string()).is_some() {
+                bail!("schematic field '{name}' appears more than once");
+            }
+        }
+    }
+    if !fields.contains_key("Datasheet") {
+        if let Some(value) = optional_netlist_scalar(component, "datasheet")? {
+            fields.insert("Datasheet".to_string(), value);
+        }
+    }
+    if !fields.contains_key("Description") {
+        let mut description = optional_netlist_scalar(component, "description")?;
+        if description.is_none() {
+            if let Some(libsource) = component.find("libsource") {
+                description = optional_netlist_scalar(libsource, "description")?;
+            }
+        }
+        if let Some(value) = description {
+            fields.insert("Description".to_string(), value);
+        }
+    }
+    fields.retain(|name, _| !matches!(name.as_str(), "Reference" | "Value" | "Footprint"));
+    // Exporter property nodes also contain sheet names, filters and flags; they
+    // are not schematic fields. DNP is handled separately by the caller.
+    Ok(fields)
+}
+
+fn optional_netlist_scalar(node: &SexpNode, tag: &str) -> Result<Option<String>> {
+    let nodes = node.find_all(tag);
+    if nodes.len() > 1 {
+        bail!("KiCad netlist repeats {tag}");
+    }
+    let Some(node) = nodes.first() else {
+        return Ok(None);
+    };
+    if node.children().map(|children| children.len()).unwrap_or(0) > 2 {
+        bail!("KiCad netlist has malformed {tag}");
+    }
+    Ok(Some(match node.get(1) {
+        Some(value) => value
+            .as_str()
+            .with_context(|| format!("{tag} is not a scalar"))?
+            .to_string(),
+        None => String::new(),
+    }))
+}
+
 fn required_value(node: &SexpNode, tag: &str) -> Result<String> {
     node.find_str(tag)
         .map(str::to_owned)
@@ -1133,6 +1234,7 @@ fn update_footprint_item(
         value,
         symbol_path,
         dnp,
+        fields,
         pad_nets,
         ..
     } = change
@@ -1151,6 +1253,7 @@ fn update_footprint_item(
         value,
         symbol_path,
         *dnp,
+        fields,
         pad_nets,
         net_codes,
     )?;
@@ -1168,11 +1271,13 @@ fn apply_footprint_fields(
     value: &str,
     symbol_path: &str,
     dnp: bool,
+    fields: &BTreeMap<String, String>,
     pad_nets: &BTreeMap<String, String>,
     net_codes: &BTreeMap<String, i32>,
 ) -> Result<()> {
     use konnect_ipc::gen::kiapi;
 
+    overlay_schematic_fields(footprint, fields)?;
     set_field_text(&mut footprint.reference_field, "Reference", reference);
     set_field_text(&mut footprint.value_field, "Value", value);
     let definition = footprint
@@ -1182,24 +1287,30 @@ fn apply_footprint_fields(
     set_field_text(&mut definition.reference_field, "Reference", reference);
     set_field_text(&mut definition.value_field, "Value", value);
 
-    footprint.symbol_path = Some(kiapi::common::types::SheetPath {
-        path: symbol_path
-            .split('/')
-            .filter(|part| !part.is_empty())
-            .map(|part| kiapi::common::types::Kiid {
-                value: part.to_string(),
-            })
-            .collect(),
-        path_human_readable: String::new(),
-    });
-    footprint
-        .attributes
-        .get_or_insert_with(Default::default)
-        .do_not_populate = dnp;
-    definition
-        .attributes
-        .get_or_insert_with(Default::default)
-        .do_not_populate = dnp;
+    if board_symbol_path(footprint.symbol_path.as_ref()).as_deref() != Some(symbol_path) {
+        footprint.symbol_path = Some(kiapi::common::types::SheetPath {
+            path: symbol_path
+                .split('/')
+                .filter(|part| !part.is_empty())
+                .map(|part| kiapi::common::types::Kiid {
+                    value: part.to_string(),
+                })
+                .collect(),
+            path_human_readable: String::new(),
+        });
+    }
+    if dnp || footprint.attributes.is_some() {
+        footprint
+            .attributes
+            .get_or_insert_with(Default::default)
+            .do_not_populate = dnp;
+    }
+    if dnp || definition.attributes.is_some() {
+        definition
+            .attributes
+            .get_or_insert_with(Default::default)
+            .do_not_populate = dnp;
+    }
 
     let mut seen_pads = std::collections::HashSet::new();
     for child in &mut definition.items {
@@ -1220,6 +1331,12 @@ fn apply_footprint_fields(
                 format!("footprint {reference} has a pad KiCad sent in a form Konnect cannot read")
             })?;
         seen_pads.insert(pad.number.clone());
+        let desired_net = pad_nets.get(&pad.number).map(String::as_str).unwrap_or("");
+        if pad.net.as_ref().map(|net| net.name.as_str()).unwrap_or("") == desired_net {
+            // Keep the original Any bytes (including unknown protobuf fields)
+            // and KiCad's net code when only schematic fields changed.
+            continue;
+        }
         pad.net = pad_nets
             .get(&pad.number)
             .map(|name| kiapi::board::types::Net {
@@ -1232,7 +1349,7 @@ fn apply_footprint_fields(
                     .map(|value| kiapi::board::types::NetCode { value }),
                 name: name.clone(),
             });
-        *child = konnect_ipc::builders::pack_any(&pad, "kiapi.board.types.Pad");
+        child.value = pad.encode_to_vec();
     }
     for number in pad_nets.keys() {
         if !seen_pads.contains(number) {
@@ -1241,6 +1358,105 @@ fn apply_footprint_fields(
     }
 
     Ok(())
+}
+
+fn overlay_schematic_fields(
+    footprint: &mut konnect_ipc::gen::kiapi::board::types::FootprintInstance,
+    fields: &BTreeMap<String, String>,
+) -> Result<()> {
+    use konnect_ipc::gen::kiapi;
+
+    // Validate the entire typed field set before mutating any of it. Unknown
+    // item types are not fields, even when their bytes happen to decode as one.
+    let current = footprint_field_slots(footprint)?;
+    for name in fields.keys() {
+        if name.trim().is_empty() || matches!(name.as_str(), "Reference" | "Value" | "Footprint") {
+            bail!("invalid schematic metadata field '{name}'");
+        }
+    }
+    let position = footprint.position.as_ref();
+    let layer = if footprint.layer == kiapi::board::types::BoardLayer::BlBCu as i32 {
+        "B.Fab"
+    } else {
+        "F.Fab"
+    };
+    let definition = footprint
+        .definition
+        .as_mut()
+        .context("board footprint has no library definition")?;
+    for (name, instance_slot, definition_slot) in [
+        (
+            "Datasheet",
+            &mut footprint.datasheet_field,
+            &mut definition.datasheet_field,
+        ),
+        (
+            "Description",
+            &mut footprint.description_field,
+            &mut definition.description_field,
+        ),
+    ] {
+        if let Some(value) = fields.get(name) {
+            for slot in [instance_slot, definition_slot] {
+                if slot.is_none() {
+                    *slot = Some(hidden_footprint_field(name, value, position, layer)?);
+                }
+                set_field_text(slot, name, value);
+            }
+        }
+    }
+    for child in &mut definition.items {
+        if !konnect_ipc::builders::any_is(child, "kiapi.board.types.Field") {
+            continue;
+        }
+        let mut field = kiapi::board::types::Field::decode(child.value.as_slice())?;
+        if let Some(value) = fields.get(&field.name) {
+            if validated_field_value(&field)? != value {
+                // Only nested text changes: numeric FieldId, BoardText KIID,
+                // parent, visibility and the complete presentation survive.
+                field.text.as_mut().unwrap().text.as_mut().unwrap().text = value.clone();
+                child.value = field.encode_to_vec();
+            }
+        }
+    }
+    for (name, value) in fields {
+        if !matches!(name.as_str(), "Datasheet" | "Description")
+            && !current.contains_key(&format!("custom.{name}"))
+        {
+            definition.items.push(konnect_ipc::builders::pack_any(
+                &hidden_footprint_field(name, value, position, layer)?,
+                "kiapi.board.types.Field",
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn hidden_footprint_field(
+    name: &str,
+    value: &str,
+    position: Option<&konnect_ipc::gen::kiapi::common::types::Vector2>,
+    layer: &str,
+) -> Result<konnect_ipc::gen::kiapi::board::types::Field> {
+    let position =
+        position.context("cannot anchor a new field on a footprint without a position")?;
+    let mut text = konnect_ipc::builders::board_text(layer, value, 0.0, 0.0, 1.0, 0.0, false);
+    let content = text
+        .text
+        .as_mut()
+        .expect("board text builder supplies text");
+    content.position = Some(*position);
+    content
+        .attributes
+        .as_mut()
+        .expect("board text builder supplies attributes")
+        .visible = false;
+    Ok(konnect_ipc::gen::kiapi::board::types::Field {
+        name: name.to_string(),
+        visible: false,
+        text: Some(text),
+        ..Default::default()
+    })
 }
 
 /// How many pads and how many drawn items a footprint carries.
@@ -1290,6 +1506,43 @@ fn footprint_shapes<'a>(
     out
 }
 
+#[derive(Debug)]
+struct FootprintReadback {
+    shape: FootprintShape,
+    kiid: Option<String>,
+    fields: BTreeMap<String, konnect_ipc::gen::kiapi::board::types::Field>,
+}
+
+fn footprint_readback<'a>(
+    items: impl Iterator<Item = &'a prost_types::Any>,
+) -> Result<BTreeMap<String, FootprintReadback>> {
+    use konnect_ipc::gen::kiapi;
+
+    let mut out = BTreeMap::new();
+    for item in items {
+        let footprint = kiapi::board::types::FootprintInstance::decode(item.value.as_slice())
+            .context("readback contains an invalid footprint item")?;
+        let reference = field_text(&footprint.reference_field);
+        let fields = footprint_field_slots(&footprint)?;
+        let shape = footprint_shapes(std::iter::once(item))
+            .remove(&reference)
+            .unwrap_or_default();
+        out.insert(
+            reference,
+            FootprintReadback {
+                shape,
+                kiid: footprint
+                    .id
+                    .as_ref()
+                    .map(|id| id.value.clone())
+                    .filter(|id| !id.is_empty()),
+                fields,
+            },
+        );
+    }
+    Ok(out)
+}
+
 /// Read the board back and hold it to what was just sent.
 ///
 /// `create_items`/`update_items` only confirm that KiCad *accepted* each item,
@@ -1302,8 +1555,9 @@ fn footprint_shapes<'a>(
 /// in place it should never fire. `delete_footprint` already re-queries after
 /// mutating; this follows it.
 ///
-/// **It fails the call only on a gained pad.** KiCad has no business inventing
-/// one, so that is unambiguous and is #244's exact signature. A *drop* in
+/// Missing footprints, field values or existing field identities fail closed:
+/// accepting a shape-only match would hide an ECO KiCad did not retain.
+/// A gained pad also fails the call: it is #244's exact signature. A *drop* in
 /// drawings is reported instead of refused, because it has a benign
 /// explanation this check cannot yet rule out — KiCad re-creates a footprint's
 /// children from the message on deserialize, and if it promotes a `BoardText`
@@ -1314,7 +1568,7 @@ fn footprint_shapes<'a>(
 fn verify_board_matches_what_was_sent(
     client: &konnect_ipc::KiCadIpcClient,
     document: &konnect_ipc::gen::kiapi::common::types::DocumentSpecifier,
-    expected: &BTreeMap<String, FootprintShape>,
+    expected: &BTreeMap<String, FootprintReadback>,
 ) -> Result<Vec<String>> {
     use konnect_ipc::gen::kiapi;
 
@@ -1325,24 +1579,26 @@ fn verify_board_matches_what_was_sent(
         document.clone(),
         kiapi::common::types::KiCadObjectType::KotPcbFootprint,
     )?;
-    let actual = footprint_shapes(items.iter());
+    let actual = footprint_readback(items.iter())?;
 
     let mut corrupted = Vec::new();
+    let mut field_errors = Vec::new();
     let mut suspicious = Vec::new();
     for (reference, want) in expected {
-        // A reference the read-back cannot see is its own problem, but not this
-        // check's: KiCad may name it differently after a rename, and failing
-        // here would turn a successful sync into an error over bookkeeping.
         let Some(got) = actual.get(reference) else {
+            field_errors.push(format!(
+                "{reference}: the sent footprint is missing from readback"
+            ));
             continue;
         };
+        field_errors.extend(footprint_field_verification_errors(reference, want, got)?);
         let detail = format!(
             "{reference}: sent {} pads and {} drawings, board now has {} and {}",
-            want.pads, want.drawings, got.pads, got.drawings
+            want.shape.pads, want.shape.drawings, got.shape.pads, got.shape.drawings
         );
-        if got.pads > want.pads {
+        if got.shape.pads > want.shape.pads {
             corrupted.push(detail);
-        } else if got != want {
+        } else if got.shape != want.shape {
             suspicious.push(detail);
         }
     }
@@ -1354,7 +1610,182 @@ fn verify_board_matches_what_was_sent(
             corrupted.join("; ")
         );
     }
+    if !field_errors.is_empty() {
+        bail!(
+            "KiCad's board did not retain the fields or existing identities this sync sent — \
+             inspect the board before saving: {}",
+            field_errors.join("; ")
+        );
+    }
     Ok(suspicious)
+}
+
+/// This is called only after EndCommit confirmed publication. Never let an
+/// ordinary readback error reach attempt_ipc_write's preflight classification.
+fn verify_committed_footprints(
+    client: &konnect_ipc::KiCadIpcClient,
+    document: &konnect_ipc::gen::kiapi::common::types::DocumentSpecifier,
+    expected: &BTreeMap<String, FootprintReadback>,
+) -> std::result::Result<Vec<String>, CallToolResult> {
+    verify_board_matches_what_was_sent(client, document, expected).map_err(|error| {
+        let reason = format!("KiCad committed the schematic-to-PCB update, but readback could not verify it: {error:#}");
+        CallToolResult::error_kind(
+            crate::mcp::error::ToolErrorKind::IpcOutcomeUnknown {
+                board_state: "committed".to_string(),
+                retry_safe: false,
+                reason: reason.clone(),
+            },
+            format!("{reason}. Do not save, repeat the mutation or edit the saved file. Inspect the live board and use KiCad's native Undo (Ctrl-Z / Cmd-Z) to reverse this committed update if needed. No automatic rollback or file fallback was attempted."),
+        )
+    })
+}
+
+fn footprint_field_verification_errors(
+    reference: &str,
+    want: &FootprintReadback,
+    got: &FootprintReadback,
+) -> Result<Vec<String>> {
+    let mut errors = Vec::new();
+    if want.kiid.is_some() && want.kiid != got.kiid {
+        errors.push(format!("{reference}: footprint KIID changed"));
+    }
+    for (slot, want_field) in &want.fields {
+        let alias = slot.split_once('.').and_then(|(location, name)| {
+            let other = match location {
+                "definition" => "instance",
+                "instance" => "definition",
+                _ => return None,
+            };
+            Some(format!("{other}.{name}"))
+        });
+        let exact = got.fields.get(slot);
+        let got_field = exact.or_else(|| alias.as_ref().and_then(|key| got.fields.get(key)));
+        let Some(got_field) = got_field else {
+            errors.push(format!("{reference}: field {slot} is missing"));
+            continue;
+        };
+        if validated_field_value(want_field)? != validated_field_value(got_field)? {
+            errors.push(format!(
+                "{reference}: field {slot} value differs from what was sent"
+            ));
+        }
+        // New fields have no IDs yet: KiCad may assign both IDs on creation.
+        if want_field.id.is_some() && want_field.id != got_field.id {
+            errors.push(format!("{reference}: field {slot} numeric ID changed"));
+        }
+        let want_id = want_field.text.as_ref().and_then(|text| text.id.as_ref());
+        let got_id = got_field.text.as_ref().and_then(|text| text.id.as_ref());
+        if want_id.is_some() && want_id != got_id {
+            errors.push(format!("{reference}: field {slot} text KIID changed"));
+        }
+        // Captures emit mandatory fields only in instance slots. If a slot
+        // was omitted, compare its effective counterpart's presentation, not
+        // a synthesized definition slot's unset/default style. IDs above are
+        // still checked against the original slot, never discarded as aliases.
+        let presentation = if exact.is_none() {
+            alias
+                .as_ref()
+                .and_then(|key| want.fields.get(key))
+                .unwrap_or(want_field)
+        } else {
+            want_field
+        };
+        if presentation.visible != got_field.visible {
+            errors.push(format!(
+                "{reference}: field {slot} visibility differs from what was sent"
+            ));
+        }
+        if !field_presentations_match(presentation, got_field) {
+            errors.push(format!(
+                "{reference}: field {slot} presentation differs from what was sent"
+            ));
+        }
+    }
+    Ok(errors)
+}
+
+fn field_presentations_match(
+    want: &konnect_ipc::gen::kiapi::board::types::Field,
+    got: &konnect_ipc::gen::kiapi::board::types::Field,
+) -> bool {
+    use konnect_ipc::gen::kiapi;
+
+    let (Some(want_board), Some(got_board)) = (&want.text, &got.text) else {
+        return false;
+    };
+    let (Some(want_text), Some(got_text)) = (&want_board.text, &got_board.text) else {
+        return false;
+    };
+    if want_board.layer != got_board.layer
+        || want_board.knockout != got_board.knockout
+        || (want_board.locked == kiapi::common::types::LockedState::LsLocked as i32)
+            != (got_board.locked == kiapi::common::types::LockedState::LsLocked as i32)
+        || want_text.hyperlink != got_text.hyperlink
+        || want_text
+            .position
+            .as_ref()
+            .is_some_and(|position| Some(position) != got_text.position.as_ref())
+    {
+        return false;
+    }
+    let Some(want) = want_text.attributes.as_ref() else {
+        // No presentation was authored in a sparse mandatory slot; KiCad
+        // initializes it. Existing native fields and new hidden fields carry
+        // attributes, so their presentation is always constrained below.
+        return true;
+    };
+    let Some(got) = got_text.attributes.as_ref() else {
+        return false;
+    };
+    // KiCad's stroke font has an empty native name; "KiCad Font" is its UI
+    // alias. The retained native captures use centered alignment, line spacing
+    // 1 and LS_UNLOCKED; unspecified proto defaults denote those defaults.
+    let font = |name: &str| name.is_empty() || name == "KiCad Font";
+    let same_font =
+        want.font_name == got.font_name || (font(&want.font_name) && font(&got.font_name));
+    let horizontal = |value| {
+        if value == 0 {
+            kiapi::common::types::HorizontalAlignment::HaCenter as i32
+        } else {
+            value
+        }
+    };
+    let vertical = |value| {
+        if value == 0 {
+            kiapi::common::types::VerticalAlignment::VaCenter as i32
+        } else {
+            value
+        }
+    };
+    let spacing = |value| if value == 0.0 { 1.0 } else { value };
+    let want_angle = want
+        .angle
+        .as_ref()
+        .map(|angle| angle.value_degrees)
+        .unwrap_or(0.0);
+    let got_angle = got
+        .angle
+        .as_ref()
+        .map(|angle| angle.value_degrees)
+        .unwrap_or(0.0);
+    // Whole-turn aliases can differ in their final floating-point bits.
+    let same_angle = ((want_angle - got_angle + 180.0).rem_euclid(360.0) - 180.0).abs() <= 1e-9;
+    same_font && same_angle
+        && horizontal(want.horizontal_alignment) == horizontal(got.horizontal_alignment)
+        && vertical(want.vertical_alignment) == vertical(got.vertical_alignment)
+        && spacing(want.line_spacing) == spacing(got.line_spacing)
+        && want.size.as_ref().is_none_or(|size| Some(size) == got.size.as_ref())
+        // An unset/zero pen width is resolved by KiCad. Authored widths from
+        // native captures, library fields and the hidden-field builder must
+        // survive exactly; no synthesized default is compared to that width.
+        && want.stroke_width.as_ref().filter(|width| width.value_nm > 0)
+            .is_none_or(|width| Some(width) == got.stroke_width.as_ref())
+        && want.italic == got.italic && want.bold == got.bold
+        && want.underlined == got.underlined && want.mirrored == got.mirrored
+        && want.multiline == got.multiline && want.keep_upright == got.keep_upright
+    // TextAttributes.visible is deprecated since 9.0.1: native captures set it
+    // true even on hidden fields. Only Field.visible determines visibility.
+    // BoardText.parent is read-only and may be assigned to a newly added field.
 }
 
 fn set_field_text(
@@ -1692,6 +2123,7 @@ fn board_footprint_from_instance(
             .map(|id| format!("{}:{}", id.library_nickname, id.entry_name))
             .unwrap_or_default(),
         symbol_path: board_symbol_path(footprint.symbol_path.as_ref()),
+        fields: board_field_values(footprint)?,
         pad_nets,
         pad_numbers,
         position: Point {
@@ -1720,6 +2152,109 @@ fn board_footprint_from_instance(
             .map(|attributes| attributes.not_in_schematic)
             .unwrap_or(false),
     })
+}
+
+fn validated_field_value(field: &konnect_ipc::gen::kiapi::board::types::Field) -> Result<&str> {
+    if field.name.trim().is_empty() {
+        bail!("board footprint contains a field without a name");
+    }
+    field
+        .text
+        .as_ref()
+        .and_then(|text| text.text.as_ref())
+        .map(|text| text.text.as_str())
+        .with_context(|| format!("board field '{}' has no nested text value", field.name))
+}
+
+/// Keep both mandatory slots distinct for readback and identity checks. They
+/// are two presentations of one field, not duplicate custom properties.
+fn footprint_field_slots(
+    footprint: &konnect_ipc::gen::kiapi::board::types::FootprintInstance,
+) -> Result<BTreeMap<String, konnect_ipc::gen::kiapi::board::types::Field>> {
+    use konnect_ipc::gen::kiapi;
+
+    let definition = footprint
+        .definition
+        .as_ref()
+        .context("board footprint has no library definition")?;
+    let mut slots = BTreeMap::new();
+    for (name, instance, library) in [
+        (
+            "Reference",
+            &footprint.reference_field,
+            &definition.reference_field,
+        ),
+        ("Value", &footprint.value_field, &definition.value_field),
+        (
+            "Datasheet",
+            &footprint.datasheet_field,
+            &definition.datasheet_field,
+        ),
+        (
+            "Description",
+            &footprint.description_field,
+            &definition.description_field,
+        ),
+    ] {
+        for (location, slot) in [("instance", instance), ("definition", library)] {
+            if let Some(field) = slot {
+                if field.name != name {
+                    bail!("board {location} {name} slot is named '{}'", field.name);
+                }
+                validated_field_value(field)?;
+                slots.insert(format!("{location}.{name}"), field.clone());
+            }
+        }
+    }
+    for item in &definition.items {
+        if !konnect_ipc::builders::any_is(item, "kiapi.board.types.Field") {
+            continue;
+        }
+        let field = kiapi::board::types::Field::decode(item.value.as_slice())
+            .context("board footprint contains an invalid typed custom field")?;
+        validated_field_value(&field)?;
+        if matches!(
+            field.name.as_str(),
+            "Reference" | "Value" | "Footprint" | "Datasheet" | "Description"
+        ) {
+            bail!(
+                "board footprint contains a duplicate or reserved custom field '{}'",
+                field.name
+            );
+        }
+        let key = format!("custom.{}", field.name);
+        if slots.insert(key, field.clone()).is_some() {
+            bail!(
+                "board footprint contains more than one custom field named '{}'",
+                field.name
+            );
+        }
+    }
+    Ok(slots)
+}
+
+fn board_field_values(
+    footprint: &konnect_ipc::gen::kiapi::board::types::FootprintInstance,
+) -> Result<BTreeMap<String, String>> {
+    let slots = footprint_field_slots(footprint)?;
+    let mut values = BTreeMap::new();
+    for name in ["Datasheet", "Description"] {
+        if let Some(field) = slots
+            .get(&format!("instance.{name}"))
+            .or_else(|| slots.get(&format!("definition.{name}")))
+        {
+            values.insert(name.to_string(), validated_field_value(field)?.to_string());
+        }
+    }
+    for (key, field) in &slots {
+        if key.starts_with("custom.") {
+            values.insert(
+                field.name.clone(),
+                validated_field_value(field)?.to_string(),
+            );
+        }
+    }
+    Ok(values)
 }
 
 fn field_text(field: &Option<konnect_ipc::gen::kiapi::board::types::Field>) -> String {
@@ -1827,15 +2362,13 @@ fn prepare_footprint(
     })?;
     let unsupported =
         |error: anyhow::Error| ("unsupported_library_footprint", format!("{error:#}"));
-    let pads = super::pcb_components::extract_pad_definitions(&source).map_err(unsupported)?;
-    let graphics =
-        super::pcb_components::extract_graphic_definitions(&source).map_err(unsupported)?;
-    let fields = super::pcb_components::extract_field_placement(&source);
-    let (width, height) = footprint_dimensions(&pads, &graphics);
+    let library = parse_library_footprint(footprint_id, &source).map_err(unsupported)?;
+    // Refresh can accept partial mandatory presentation that a fresh import
+    // refuses. Exercise the pure constructor before a dry run reports ready.
+    build_import_instance(&library, 0.0, 0.0).map_err(unsupported)?;
+    let (width, height) = footprint_dimensions(&library.pads, &library.graphics);
     Ok(PreparedFootprint {
-        pads,
-        graphics,
-        fields,
+        library,
         width,
         height,
     })
@@ -1913,6 +2446,7 @@ fn additions_missing_pads(
             continue;
         };
         let available = part
+            .library
             .pads
             .iter()
             .map(|pad| pad.number.clone())
@@ -2021,8 +2555,6 @@ fn build_mutation_items(
     prepared: &BTreeMap<String, PreparedFootprint>,
     snapshot: &LiveSnapshot,
 ) -> Result<(Vec<prost_types::Any>, Vec<prost_types::Any>)> {
-    use konnect_ipc::gen::kiapi;
-
     let mut creates = Vec::new();
     let mut updates = Vec::new();
     for change in &plan.changes {
@@ -2033,32 +2565,21 @@ fn build_mutation_items(
                 footprint_id,
                 symbol_path,
                 dnp,
+                fields,
                 pad_nets,
                 position,
             } => {
                 let part = prepared
                     .get(footprint_id)
                     .with_context(|| format!("no prepared footprint for {footprint_id}"))?;
-                let item = konnect_ipc::KiCadIpcClient::build_footprint_item(
-                    footprint_id,
-                    reference,
-                    value,
-                    &part.pads,
-                    &part.graphics,
-                    &part.fields,
-                    position.x,
-                    position.y,
-                    0.0,
-                    "F.Cu",
-                )?;
-                let mut footprint =
-                    kiapi::board::types::FootprintInstance::decode(item.value.as_slice())?;
+                let mut footprint = build_import_instance(&part.library, position.x, position.y)?;
                 apply_footprint_fields(
                     &mut footprint,
                     reference,
                     value,
                     symbol_path,
                     *dnp,
+                    fields,
                     pad_nets,
                     &snapshot.net_codes,
                 )?;
@@ -2495,6 +3016,761 @@ mod tests {
         assert!(!component.dnp);
     }
 
+    fn netlist_with_fields(extra: &str) -> String {
+        ONE_RESISTOR.replace("(sheetpath", &format!("{extra}\n      (sheetpath"))
+    }
+
+    #[test]
+    fn exported_fields_use_kicad_scalar_values_and_do_not_copy_exporter_properties() {
+        let source = netlist_with_fields(
+            r#"
+            (fields
+                (field (name "Reference") "ignored")
+                (field (name "Value") "ignored")
+                (field (name "Footprint") "ignored")
+                (field (name "Trial") "headless")
+                (field (name "CircuitNote") "Illustrative 5 V; not hardware-qualified")
+                (field (name "Datasheet"))
+                (field (name "Description") ""))
+            (datasheet "must not override an explicit clear")
+            (description "must not override an explicit clear")
+            (libsource (description "library fallback"))
+            (property (name "Trial") (value "exporter duplicate"))
+            (property (name "Sheetname") (value "Power"))
+            (property (name "Sheetfile") (value "power.kicad_sch"))
+            (property (name "ki_keywords") (value "resistor"))
+            (property (name "ki_fp_filters") (value "R_*"))
+        "#,
+        );
+        let design = parse_exported_netlist(&source).unwrap();
+        assert_eq!(
+            design.components[0].fields,
+            BTreeMap::from([
+                (
+                    "CircuitNote".to_string(),
+                    "Illustrative 5 V; not hardware-qualified".to_string()
+                ),
+                ("Datasheet".to_string(), String::new()),
+                ("Description".to_string(), String::new()),
+                ("Trial".to_string(), "headless".to_string()),
+            ])
+        );
+        assert_eq!(design.components[0].reference, "R1");
+        assert_eq!(design.components[0].value, "10k");
+        let real_export = parse_exported_netlist(UNASSIGNED).unwrap();
+        let capacitor = real_export
+            .components
+            .iter()
+            .find(|part| part.reference == "C1")
+            .unwrap();
+        assert_eq!(capacitor.fields["Datasheet"], "");
+        assert_eq!(capacitor.fields["Description"], "Unpolarized capacitor");
+    }
+
+    #[test]
+    fn field_fallbacks_apply_only_when_the_field_is_absent() {
+        let design = parse_exported_netlist(&netlist_with_fields(
+            r#"
+            (datasheet "https://example.test/r.pdf")
+            (libsource (description "library description"))
+        "#,
+        ))
+        .unwrap();
+        assert_eq!(
+            design.components[0].fields,
+            BTreeMap::from([
+                (
+                    "Datasheet".to_string(),
+                    "https://example.test/r.pdf".to_string()
+                ),
+                ("Description".to_string(), "library description".to_string()),
+            ])
+        );
+        let design = parse_exported_netlist(&netlist_with_fields(
+            r#"
+            (fields (field (name "Description")))
+            (libsource (description "library description"))
+        "#,
+        ))
+        .unwrap();
+        assert_eq!(design.components[0].fields["Description"], "");
+        assert!(!design.components[0].fields.contains_key("Datasheet"));
+        assert!(parse_exported_netlist(ONE_RESISTOR).unwrap().components[0]
+            .fields
+            .is_empty());
+    }
+
+    #[test]
+    fn duplicate_or_malformed_exported_fields_fail_before_planning() {
+        for extra in [
+            r#"(fields (field))"#,
+            r#"(fields (field "Trial" "headless"))"#,
+            r#"(fields (field (name "") "headless"))"#,
+            r#"(fields (field (name " ") "headless"))"#,
+            r#"(fields (field (name (nested "Trial")) "headless"))"#,
+            r#"(fields (field (name "Trial" "extra") "headless"))"#,
+            r#"(fields (field (name "Trial") (value "headless")))"#,
+            r#"(fields (field (name "Trial") "one" "two"))"#,
+            r#"(fields (field (name "Trial") "one") (field (name "Trial")))"#,
+            r#"(fields (field (name "Reference") "one") (field (name "Reference") "two"))"#,
+            r#"(fields (property (name "Trial") "headless"))"#,
+            r#"(fields bad)"#,
+            r#"(fields) (fields)"#,
+            r#"(datasheet (value "bad"))"#,
+            r#"(libsource (description "one" "two"))"#,
+        ] {
+            let error = parse_exported_netlist(&netlist_with_fields(extra)).expect_err(extra);
+            assert!(
+                format!("{error:#}").contains("schematic fields"),
+                "{extra}: {error:#}"
+            );
+        }
+    }
+
+    fn identified_field(
+        name: &str,
+        value: &str,
+        id: i32,
+    ) -> konnect_ipc::gen::kiapi::board::types::Field {
+        use konnect_ipc::gen::kiapi;
+        let mut text =
+            konnect_ipc::builders::board_text("B.SilkS", value, 4.0, 5.0, 1.25, 17.0, true);
+        text.id = Some(kiapi::common::types::Kiid {
+            value: format!("field-{id}-uuid"),
+        });
+        text.parent = Some(kiapi::common::types::Kiid {
+            value: "u1-kiid".to_string(),
+        });
+        text.locked = kiapi::common::types::LockedState::LsLocked as i32;
+        text.text
+            .as_mut()
+            .unwrap()
+            .attributes
+            .as_mut()
+            .unwrap()
+            .bold = true;
+        kiapi::board::types::Field {
+            id: Some(kiapi::board::types::FieldId { id }),
+            name: name.to_string(),
+            visible: true,
+            text: Some(text),
+        }
+    }
+
+    fn field_eco_instance() -> konnect_ipc::gen::kiapi::board::types::FootprintInstance {
+        use konnect_ipc::gen::kiapi;
+        let item = footprint_with_artwork("U1");
+        let mut footprint =
+            kiapi::board::types::FootprintInstance::decode(item.value.as_slice()).unwrap();
+        footprint.layer = kiapi::board::types::BoardLayer::BlBCu as i32;
+        footprint.orientation = Some(kiapi::common::types::Angle {
+            value_degrees: 90.0,
+        });
+        footprint.locked = kiapi::common::types::LockedState::LsLocked as i32;
+        footprint.symbol_path = Some(kiapi::common::types::SheetPath {
+            path: vec![
+                kiapi::common::types::Kiid {
+                    value: "root".to_string(),
+                },
+                kiapi::common::types::Kiid {
+                    value: "u1".to_string(),
+                },
+            ],
+            path_human_readable: "/Power/".to_string(),
+        });
+        footprint.datasheet_field = Some(identified_field("Datasheet", "old.pdf", 2));
+        footprint.description_field = Some(identified_field("Description", "old description", 3));
+        let definition = footprint.definition.as_mut().unwrap();
+        definition.datasheet_field = Some(identified_field("Datasheet", "old.pdf", 22));
+        definition.description_field = Some(identified_field("Description", "old description", 23));
+        for child in &mut definition.items {
+            if konnect_ipc::builders::any_is(child, "kiapi.board.types.Pad") {
+                let mut pad = kiapi::board::types::Pad::decode(child.value.as_slice()).unwrap();
+                pad.id = Some(kiapi::common::types::Kiid {
+                    value: "pad-uuid".to_string(),
+                });
+                pad.net = Some(kiapi::board::types::Net {
+                    name: "GND".to_string(),
+                    code: Some(kiapi::board::types::NetCode { value: 42 }),
+                });
+                child.value = pad.encode_to_vec();
+                // An unknown, valid varint property must survive a field-only
+                // update; decoding/repacking an unchanged pad would lose it.
+                child.value.extend_from_slice(&[0xf8, 0x07, 0x01]);
+                child.type_url = "capture/kiapi.board.types.Pad".to_string();
+            }
+        }
+        for field in [
+            identified_field("Trial", "before", 10),
+            identified_field("PCBOnly", "keep", 11),
+        ] {
+            definition.items.push(konnect_ipc::builders::pack_any(
+                &field,
+                "kiapi.board.types.Field",
+            ));
+        }
+        let library = parse_library_footprint(
+            STOCK_0603,
+            include_str!("../../tests/fixtures/c_0603_1608metric_kicad10.kicad_mod"),
+        )
+        .unwrap();
+        let stock = build_import_instance(&library, 25.0, 30.0).unwrap();
+        definition
+            .items
+            .extend(stock.definition.unwrap().items.into_iter().filter(|item| {
+                konnect_ipc::builders::any_is(item, "kiapi.board.types.Footprint3DModel")
+            }));
+        footprint
+    }
+
+    fn field_design(
+        footprint: &konnect_ipc::gen::kiapi::board::types::FootprintInstance,
+        fields: BTreeMap<String, String>,
+    ) -> ExportedDesign {
+        let board = board_footprint_from_instance(footprint).unwrap();
+        ExportedDesign {
+            components: vec![DesignComponent {
+                reference: board.reference,
+                value: board.value,
+                footprint_id: board.footprint_id,
+                symbol_path: board.symbol_path.unwrap(),
+                dnp: board.dnp,
+                fields,
+                pad_nets: board.pad_nets,
+            }],
+            skipped: Vec::new(),
+            unassigned: Vec::new(),
+        }
+    }
+
+    fn field_snapshot(
+        footprint: &konnect_ipc::gen::kiapi::board::types::FootprintInstance,
+    ) -> LiveSnapshot {
+        let board = board_footprint_from_instance(footprint).unwrap();
+        LiveSnapshot {
+            items: BTreeMap::from([(
+                board.kiid.clone(),
+                konnect_ipc::builders::pack_any(footprint, "kiapi.board.types.FootprintInstance"),
+            )]),
+            state: board_with(vec![board]),
+            // Deliberately different from the pad's live code: a field-only
+            // ECO must leave the existing pad Any and code exactly unchanged.
+            net_codes: BTreeMap::from([("GND".to_string(), 99)]),
+            document: Default::default(),
+        }
+    }
+
+    #[test]
+    fn field_only_eco_keeps_field_ids_presentation_pose_models_path_and_pad_bytes() {
+        use konnect_ipc::gen::kiapi;
+        let before = field_eco_instance();
+        let desired = BTreeMap::from([
+            ("Trial".to_string(), "after".to_string()),
+            ("Datasheet".to_string(), String::new()),
+            (
+                "Description".to_string(),
+                "schematic description".to_string(),
+            ),
+            ("NewField".to_string(), "added".to_string()),
+        ]);
+        let design = field_design(&before, desired.clone());
+        let snapshot = field_snapshot(&before);
+        let plan = plan_sync("field ECO", &design, &snapshot.state);
+        assert_eq!(plan.status, PlanStatus::Ready);
+        assert_eq!(plan.counts.updated.planned, 1);
+        assert_eq!(plan.counts.pads_reassigned.planned, 0);
+        assert!(
+            matches!(&plan.changes[0], PlannedChange::Update { fields, .. } if fields == &desired)
+        );
+        let (creates, updates) = build_mutation_items(&plan, &BTreeMap::new(), &snapshot).unwrap();
+        assert!(
+            creates.is_empty(),
+            "an ECO never reconstructs from a library"
+        );
+        let after =
+            kiapi::board::types::FootprintInstance::decode(updates[0].value.as_slice()).unwrap();
+        let before_fields = footprint_field_slots(&before).unwrap();
+        let after_fields = footprint_field_slots(&after).unwrap();
+        for (slot, old) in &before_fields {
+            let mut expected = old.clone();
+            if let Some(value) = desired.get(&old.name) {
+                expected.text.as_mut().unwrap().text.as_mut().unwrap().text = value.clone();
+            }
+            assert_eq!(
+                &after_fields[slot], &expected,
+                "{slot}: only nested text may change"
+            );
+        }
+        let new_field = &after_fields["custom.NewField"];
+        assert_eq!(new_field.id, None);
+        assert!(!new_field.visible);
+        let text = new_field.text.as_ref().unwrap();
+        assert_eq!(text.id, None);
+        assert_eq!(text.parent, None);
+        assert_eq!(text.text.as_ref().unwrap().position, before.position);
+        assert!(
+            !text
+                .text
+                .as_ref()
+                .unwrap()
+                .attributes
+                .as_ref()
+                .unwrap()
+                .visible
+        );
+        assert_eq!(text.layer, kiapi::board::types::BoardLayer::BlBFab as i32);
+        let mut unrelated_before = before.clone();
+        let mut unrelated_after = after.clone();
+        for footprint in [&mut unrelated_before, &mut unrelated_after] {
+            footprint.datasheet_field = None;
+            footprint.description_field = None;
+            let definition = footprint.definition.as_mut().unwrap();
+            definition.datasheet_field = None;
+            definition.description_field = None;
+            definition
+                .items
+                .retain(|item| !konnect_ipc::builders::any_is(item, "kiapi.board.types.Field"));
+        }
+        assert_eq!(
+            unrelated_after, unrelated_before,
+            "all non-field payloads must survive verbatim"
+        );
+        let noop = plan_sync("field ECO", &design, &field_snapshot(&after).state);
+        assert_eq!(noop.status, PlanStatus::Noop);
+    }
+
+    #[test]
+    fn absent_fields_preserve_board_only_values_and_explicit_empty_clears_without_deletion() {
+        use konnect_ipc::gen::kiapi;
+        let before = field_eco_instance();
+        for desired in [
+            BTreeMap::new(),
+            BTreeMap::from([("Trial".to_string(), "before".to_string())]),
+        ] {
+            let plan = plan_sync(
+                "subset",
+                &field_design(&before, desired),
+                &field_snapshot(&before).state,
+            );
+            assert_eq!(
+                plan.status,
+                PlanStatus::Noop,
+                "PCB-only fields are not schematic deletions"
+            );
+        }
+        let desired = BTreeMap::from([("Trial".to_string(), String::new())]);
+        let design = field_design(&before, desired);
+        let snapshot = field_snapshot(&before);
+        let plan = plan_sync("clear", &design, &snapshot.state);
+        let (_, updates) = build_mutation_items(&plan, &BTreeMap::new(), &snapshot).unwrap();
+        let after =
+            kiapi::board::types::FootprintInstance::decode(updates[0].value.as_slice()).unwrap();
+        let fields = footprint_field_slots(&after).unwrap();
+        let mut cleared = footprint_field_slots(&before).unwrap()["custom.Trial"].clone();
+        cleared
+            .text
+            .as_mut()
+            .unwrap()
+            .text
+            .as_mut()
+            .unwrap()
+            .text
+            .clear();
+        assert_eq!(fields["custom.Trial"], cleared);
+        assert_eq!(board_field_values(&after).unwrap()["PCBOnly"], "keep");
+        assert_eq!(after.datasheet_field, before.datasheet_field);
+        assert_eq!(after.description_field, before.description_field);
+        assert_eq!(
+            plan_sync("clear", &design, &field_snapshot(&after).state).status,
+            PlanStatus::Noop
+        );
+    }
+
+    #[test]
+    fn board_fields_are_typed_and_duplicate_or_malformed_typed_fields_fail_closed() {
+        use konnect_ipc::gen::kiapi;
+        let before = field_eco_instance();
+        assert_eq!(
+            board_field_values(&before).unwrap(),
+            BTreeMap::from([
+                ("Datasheet".to_string(), "old.pdf".to_string()),
+                ("Description".to_string(), "old description".to_string()),
+                ("PCBOnly".to_string(), "keep".to_string()),
+                ("Trial".to_string(), "before".to_string()),
+            ])
+        );
+        let mut untyped = before.clone();
+        untyped
+            .definition
+            .as_mut()
+            .unwrap()
+            .items
+            .push(konnect_ipc::builders::pack_any(
+                &identified_field("Trial", "not a field", 99),
+                "kiapi.board.types.BoardText",
+            ));
+        assert_eq!(
+            board_field_values(&untyped).unwrap(),
+            board_field_values(&before).unwrap()
+        );
+        let malformed = kiapi::board::types::Field {
+            name: "Malformed".to_string(),
+            ..Default::default()
+        };
+        for bad in [
+            konnect_ipc::builders::pack_any(
+                &identified_field("Trial", "duplicate", 99),
+                "kiapi.board.types.Field",
+            ),
+            konnect_ipc::builders::pack_any(
+                &identified_field("", "no name", 99),
+                "kiapi.board.types.Field",
+            ),
+            konnect_ipc::builders::pack_any(
+                &identified_field("Datasheet", "reserved", 99),
+                "kiapi.board.types.Field",
+            ),
+            konnect_ipc::builders::pack_any(&malformed, "kiapi.board.types.Field"),
+            prost_types::Any {
+                type_url: "type.googleapis.com/kiapi.board.types.Field".to_string(),
+                value: vec![0xff, 0xff],
+            },
+        ] {
+            let mut footprint = before.clone();
+            footprint.definition.as_mut().unwrap().items.push(bad);
+            assert!(board_footprint_from_instance(&footprint).is_err());
+            assert!(overlay_schematic_fields(&mut footprint, &BTreeMap::new()).is_err());
+        }
+        let mut fallback = before.clone();
+        fallback.datasheet_field = None;
+        assert_eq!(
+            board_field_values(&fallback).unwrap()["Datasheet"],
+            "old.pdf"
+        );
+        overlay_schematic_fields(
+            &mut fallback,
+            &BTreeMap::from([("Datasheet".to_string(), "new.pdf".to_string())]),
+        )
+        .unwrap();
+        assert_eq!(
+            fallback
+                .definition
+                .as_ref()
+                .unwrap()
+                .datasheet_field
+                .as_ref()
+                .unwrap()
+                .id,
+            before
+                .definition
+                .as_ref()
+                .unwrap()
+                .datasheet_field
+                .as_ref()
+                .unwrap()
+                .id
+        );
+        assert_eq!(
+            fallback.datasheet_field.as_ref().unwrap().id,
+            None,
+            "a new slot must not inherit an existing field's identity"
+        );
+    }
+
+    #[test]
+    fn readback_rejects_missing_fields_wrong_values_and_changed_existing_field_identities() {
+        use konnect_ipc::gen::kiapi;
+        use std::sync::{Arc, Mutex};
+        let mut sent = field_eco_instance();
+        overlay_schematic_fields(
+            &mut sent,
+            &BTreeMap::from([("NewHidden".to_string(), "hidden value".to_string())]),
+        )
+        .unwrap();
+        let packed = konnect_ipc::builders::pack_any(&sent, "kiapi.board.types.FootprintInstance");
+        let expected = footprint_readback(std::iter::once(&packed)).unwrap();
+        let items = Arc::new(Mutex::new(vec![packed.clone()]));
+        let served_items = items.clone();
+        let directory = tempfile::tempdir().unwrap();
+        let board = directory.path().join("readback.kicad_pcb");
+        std::fs::write(
+            &board,
+            include_bytes!("../../tests/fixtures/specctra_two_resistors.kicad_pcb"),
+        )
+        .unwrap();
+        let server = crate::tools::pcb_board::board_mock::spawn_kicad_holding_board(
+            &board,
+            move |command| {
+                if command.type_url.ends_with("GetItems") {
+                    return Some(konnect_ipc::builders::pack_any(
+                        &kiapi::common::commands::GetItemsResponse {
+                            header: None,
+                            status: kiapi::common::types::ItemRequestStatus::IrsOk as i32,
+                            items: served_items.lock().unwrap().clone(),
+                        },
+                        "kiapi.common.commands.GetItemsResponse",
+                    ));
+                }
+                None
+            },
+        );
+        let client = konnect_ipc::KiCadIpcClient::new(server.address().to_string());
+        let document = client.find_open_board(&board).unwrap();
+        assert!(
+            verify_board_matches_what_was_sent(&client, &document, &expected)
+                .unwrap()
+                .is_empty()
+        );
+        for (damage, message) in [
+            (0, "value differs"),
+            (1, "numeric ID changed"),
+            (2, "text KIID changed"),
+            (3, "field custom.Trial is missing"),
+            (4, "field definition.Datasheet value differs"),
+            (5, "field custom.Trial visibility differs"),
+            (6, "field custom.NewHidden visibility differs"),
+            (7, "field custom.Trial presentation differs"),
+        ] {
+            let mut wrong = sent.clone();
+            if damage == 4 {
+                set_field_text(
+                    &mut wrong.definition.as_mut().unwrap().datasheet_field,
+                    "Datasheet",
+                    "lost.pdf",
+                );
+            } else {
+                let children = &mut wrong.definition.as_mut().unwrap().items;
+                let index = children
+                    .iter()
+                    .position(|item| {
+                        konnect_ipc::builders::any_is(item, "kiapi.board.types.Field")
+                            && kiapi::board::types::Field::decode(item.value.as_slice())
+                                .unwrap()
+                                .name
+                                == if damage == 6 { "NewHidden" } else { "Trial" }
+                    })
+                    .unwrap();
+                if damage == 3 {
+                    children.remove(index);
+                } else {
+                    let mut field =
+                        kiapi::board::types::Field::decode(children[index].value.as_slice())
+                            .unwrap();
+                    match damage {
+                        0 => {
+                            field.text.as_mut().unwrap().text.as_mut().unwrap().text =
+                                "lost update".to_string()
+                        }
+                        1 => field.id = Some(kiapi::board::types::FieldId { id: 999 }),
+                        2 => field.text.as_mut().unwrap().id = None,
+                        5 => field.visible = false,
+                        6 => field.visible = true,
+                        7 => {
+                            field
+                                .text
+                                .as_mut()
+                                .unwrap()
+                                .text
+                                .as_mut()
+                                .unwrap()
+                                .attributes
+                                .as_mut()
+                                .unwrap()
+                                .size
+                                .as_mut()
+                                .unwrap()
+                                .x_nm += 1_000_000
+                        }
+                        _ => unreachable!(),
+                    }
+                    children[index].value = field.encode_to_vec();
+                }
+            }
+            let wrong =
+                konnect_ipc::builders::pack_any(&wrong, "kiapi.board.types.FootprintInstance");
+            assert_eq!(
+                footprint_shapes(std::iter::once(&wrong)),
+                footprint_shapes(std::iter::once(&packed)),
+                "shape-only validation would miss this ECO failure"
+            );
+            *items.lock().unwrap() = vec![wrong];
+            let error =
+                verify_board_matches_what_was_sent(&client, &document, &expected).unwrap_err();
+            assert!(format!("{error:#}").contains(message), "{error:#}");
+        }
+        let mut mandatory_in_both_slots = sent.clone();
+        let definition = mandatory_in_both_slots.definition.as_mut().unwrap();
+        definition.datasheet_field = mandatory_in_both_slots.datasheet_field.clone();
+        definition.description_field = mandatory_in_both_slots.description_field.clone();
+        let sent_slots = konnect_ipc::builders::pack_any(
+            &mandatory_in_both_slots,
+            "kiapi.board.types.FootprintInstance",
+        );
+        let native_expected = footprint_readback(std::iter::once(&sent_slots)).unwrap();
+        let definition = mandatory_in_both_slots.definition.as_mut().unwrap();
+        definition.reference_field = None;
+        definition.value_field = None;
+        definition.datasheet_field = None;
+        definition.description_field = None;
+        *items.lock().unwrap() = vec![konnect_ipc::builders::pack_any(
+            &mandatory_in_both_slots,
+            "kiapi.board.types.FootprintInstance",
+        )];
+        assert!(verify_board_matches_what_was_sent(&client, &document, &native_expected).unwrap().is_empty(),
+            "KiCad's native instance-only mandatory serialization still validates values and identities");
+        items.lock().unwrap().clear();
+        assert!(
+            verify_board_matches_what_was_sent(&client, &document, &expected)
+                .unwrap_err()
+                .to_string()
+                .contains("missing from readback")
+        );
+    }
+
+    #[test]
+    fn field_verification_accepts_native_defaults_and_assigned_new_ids_without_ignoring_presentation(
+    ) {
+        use konnect_ipc::gen::kiapi;
+        let captured = kiapi::board::types::FootprintInstance::decode(BOARD_ONLY_CAPTURE).unwrap();
+        let native = captured.reference_field.as_ref().unwrap();
+        assert!(
+            !native.visible,
+            "the retained native capture's reference is hidden"
+        );
+        let native_attributes = native
+            .text
+            .as_ref()
+            .unwrap()
+            .text
+            .as_ref()
+            .unwrap()
+            .attributes
+            .as_ref()
+            .unwrap();
+        assert!(
+            native_attributes.visible,
+            "the deprecated text flag is not field visibility"
+        );
+        let mut requested = native.clone();
+        requested.id = None;
+        let board_text = requested.text.as_mut().unwrap();
+        board_text.id = None;
+        board_text.parent = None;
+        board_text.locked = kiapi::common::types::LockedState::LsUnknown as i32;
+        let attributes = board_text
+            .text
+            .as_mut()
+            .unwrap()
+            .attributes
+            .as_mut()
+            .unwrap();
+        attributes.font_name = "KiCad Font".to_string();
+        attributes.horizontal_alignment =
+            kiapi::common::types::HorizontalAlignment::HaUnknown as i32;
+        attributes.vertical_alignment = kiapi::common::types::VerticalAlignment::VaUnknown as i32;
+        attributes.line_spacing = 0.0;
+        attributes.visible = false;
+        attributes
+            .angle
+            .get_or_insert_with(Default::default)
+            .value_degrees += 360.0;
+        let want = FootprintReadback {
+            shape: Default::default(),
+            kiid: None,
+            fields: BTreeMap::from([("instance.Reference".to_string(), requested)]),
+        };
+        let mut got = FootprintReadback {
+            shape: Default::default(),
+            kiid: captured.id.as_ref().map(|id| id.value.clone()),
+            fields: BTreeMap::from([("instance.Reference".to_string(), native.clone())]),
+        };
+        assert!(footprint_field_verification_errors("MH1", &want, &got).unwrap().is_empty(),
+            "native assigned IDs, stroke-font/default aliases and deprecated visibility are not loss");
+        got.fields.get_mut("instance.Reference").unwrap().visible = true;
+        assert!(footprint_field_verification_errors("MH1", &want, &got)
+            .unwrap()
+            .iter()
+            .any(|error| error.contains("visibility differs")));
+        for damage in 0..10 {
+            let mut field = native.clone();
+            let board_text = field.text.as_mut().unwrap();
+            match damage {
+                0 => board_text.layer = kiapi::board::types::BoardLayer::BlBFab as i32,
+                1 => board_text.knockout = !board_text.knockout,
+                2 => board_text.locked = kiapi::common::types::LockedState::LsLocked as i32,
+                3 => {
+                    board_text
+                        .text
+                        .as_mut()
+                        .unwrap()
+                        .position
+                        .as_mut()
+                        .unwrap()
+                        .x_nm += 1_000_000
+                }
+                _ => {
+                    let attributes = board_text
+                        .text
+                        .as_mut()
+                        .unwrap()
+                        .attributes
+                        .as_mut()
+                        .unwrap();
+                    match damage {
+                        4 => attributes.font_name = "a different font".to_string(),
+                        5 => {
+                            attributes.horizontal_alignment =
+                                kiapi::common::types::HorizontalAlignment::HaLeft as i32
+                        }
+                        6 => {
+                            attributes
+                                .angle
+                                .get_or_insert_with(Default::default)
+                                .value_degrees += 90.0
+                        }
+                        7 => attributes.stroke_width.as_mut().unwrap().value_nm += 100_000,
+                        8 => attributes.size.as_mut().unwrap().x_nm += 1_000_000,
+                        9 => attributes.mirrored = !attributes.mirrored,
+                        _ => unreachable!(),
+                    }
+                }
+            }
+            got.fields.insert("instance.Reference".to_string(), field);
+            assert!(
+                footprint_field_verification_errors("MH1", &want, &got)
+                    .unwrap()
+                    .iter()
+                    .any(|error| error.contains("presentation differs")),
+                "presentation loss {damage} must be detected"
+            );
+        }
+    }
+
+    #[test]
+    fn plan_revision_tracks_exported_and_current_fields_including_pcb_only_values() {
+        let mut board = board_with(vec![board_resistor("R1", Some("/sheet-uuid/symbol-uuid"))]);
+        board.footprints[0]
+            .fields
+            .insert("PCBOnly".to_string(), "one".to_string());
+        let source = netlist_with_fields(r#"(fields (field (name "Trial") "one"))"#);
+        let baseline = plan_revision(&source, &board);
+        assert_ne!(
+            baseline,
+            plan_revision(&source.replace("\"one\"", "\"two\""), &board)
+        );
+        board.footprints[0]
+            .fields
+            .insert("PCBOnly".to_string(), "two".to_string());
+        assert_ne!(baseline, plan_revision(&source, &board));
+        assert_ne!(
+            plan_revision(ONE_RESISTOR, &board),
+            plan_revision(
+                &netlist_with_fields(r#"(fields (field (name "Trial")))"#),
+                &board
+            )
+        );
+    }
+
     /// Real `kicad-cli sch export netlist` output: `R1` never had a footprint
     /// assigned, so the export carries no `(footprint …)` node for it and
     /// still nets its pin 1 to `C1`. Provenance in
@@ -2710,6 +3986,7 @@ mod tests {
             footprint_id: "Resistor_SMD:R_0603_1608Metric".to_string(),
             symbol_path: symbol_path.to_string(),
             dnp: false,
+            fields: BTreeMap::new(),
             pad_nets: BTreeMap::from([
                 ("1".to_string(), "VCC".to_string()),
                 ("2".to_string(), "GND".to_string()),
@@ -2724,6 +4001,7 @@ mod tests {
             value: "10k".to_string(),
             footprint_id: "Resistor_SMD:R_0603_1608Metric".to_string(),
             symbol_path: symbol_path.map(str::to_string),
+            fields: BTreeMap::new(),
             pad_nets: BTreeMap::from([
                 ("1".to_string(), "VCC".to_string()),
                 ("2".to_string(), "GND".to_string()),
@@ -2769,6 +4047,7 @@ mod tests {
                     value: "1k".to_string(),
                     footprint_id: "Resistor_SMD:R_0603_1608Metric".to_string(),
                     symbol_path: Some("/sheet/existing".to_string()),
+                    fields: BTreeMap::new(),
                     pad_nets: BTreeMap::from([
                         ("1".to_string(), "VCC".to_string()),
                         ("2".to_string(), "GND".to_string()),
@@ -2787,6 +4066,7 @@ mod tests {
                     value: "MountingHole".to_string(),
                     footprint_id: "MountingHole:MountingHole_3.2mm_M3".to_string(),
                     symbol_path: None,
+                    fields: BTreeMap::new(),
                     pad_nets: BTreeMap::new(),
                     pad_numbers: BTreeSet::new(),
                     position: Point { x: 2.0, y: 2.0 },
@@ -2960,6 +4240,7 @@ mod tests {
             value: "NE555".to_string(),
             symbol_path: "/root/u1".to_string(),
             dnp: false,
+            fields: BTreeMap::new(),
             pad_nets: BTreeMap::from([("1".to_string(), "GND".to_string())]),
             preserve: PreservedBoardState {
                 position: Point { x: 25.0, y: 30.0 },
@@ -3011,6 +4292,7 @@ mod tests {
             "NE555",
             "/root/u2",
             false,
+            &BTreeMap::new(),
             &BTreeMap::from([("1".to_string(), "VCC".to_string())]),
             &BTreeMap::from([("VCC".to_string(), 3)]),
         )
@@ -3099,6 +4381,7 @@ mod tests {
             "NE555",
             "/root/u3",
             false,
+            &BTreeMap::new(),
             &BTreeMap::from([("1".to_string(), "VCC".to_string())]),
             &BTreeMap::new(),
         )
@@ -3156,6 +4439,7 @@ mod tests {
             value: "10k".to_string(),
             symbol_path: "/root/symbol".to_string(),
             dnp: true,
+            fields: BTreeMap::new(),
             pad_nets: BTreeMap::from([("1".to_string(), "VCC".to_string())]),
             preserve: PreservedBoardState {
                 position: Point { x: 25.0, y: 30.0 },
@@ -3206,6 +4490,7 @@ mod tests {
                 value: "10k".to_string(),
                 footprint_id: "Resistor_SMD:R_0603_1608Metric".to_string(),
                 symbol_path: Some("/sheet/existing".to_string()),
+                fields: BTreeMap::new(),
                 pad_nets: BTreeMap::from([("1".to_string(), "VCC".to_string())]),
                 pad_numbers: BTreeSet::from(["1".to_string(), "2".to_string()]),
                 position: Point { x: 1.0, y: 2.0 },
@@ -3916,6 +5201,7 @@ mod tests {
         use crate::tools::{ServerConfig, ToolContext};
         use konnect_ipc::gen::kiapi;
         use prost::Message;
+        use std::sync::atomic::{AtomicBool, Ordering};
         use std::sync::{Arc, Mutex};
 
         #[derive(Clone)]
@@ -3947,6 +5233,17 @@ mod tests {
                 path_human_readable: "/Power/".to_string(),
             });
             set_field_text(&mut footprint.value_field, "Value", "1k");
+            let mut field = identified_field("Trial", "before", 12);
+            field.text.as_mut().unwrap().parent = footprint.id.clone();
+            footprint
+                .definition
+                .as_mut()
+                .unwrap()
+                .items
+                .push(konnect_ipc::builders::pack_any(
+                    &field,
+                    "kiapi.board.types.Field",
+                ));
             konnect_ipc::builders::pack_any(&footprint, "kiapi.board.types.FootprintInstance")
         }
 
@@ -3966,7 +5263,7 @@ mod tests {
         .unwrap();
         std::fs::write(
             &exported,
-            ONE_RESISTOR
+            netlist_with_fields(r#"(fields (field (name "Trial") "after"))"#)
                 .replace("Resistor_SMD:R_0603_1608Metric", "Resistor_SMD:R_0402")
                 .replace("/Power/VCC", "VCC"),
         )
@@ -4021,6 +5318,8 @@ mod tests {
         let footprints_before = state.footprints.lock().unwrap().clone();
         let zones_before = state.zones.lock().unwrap().clone();
         let responder_state = state.clone();
+        let lose_field_after_commit = Arc::new(AtomicBool::new(false));
+        let responder_loss = lose_field_after_commit.clone();
 
         let server = crate::tools::pcb_board::board_mock::spawn_kicad_holding_board(
             &board,
@@ -4137,6 +5436,24 @@ mod tests {
                     ));
                 }
                 if command.type_url.ends_with("EndCommit") {
+                    if responder_loss.swap(false, Ordering::SeqCst) {
+                        let mut items = responder_state.footprints.lock().unwrap();
+                        let mut committed = kiapi::board::types::FootprintInstance::decode(
+                            items[0].value.as_slice(),
+                        )
+                        .unwrap();
+                        committed.definition.as_mut().unwrap().items.retain(|item| {
+                            !konnect_ipc::builders::any_is(item, "kiapi.board.types.Field")
+                                || kiapi::board::types::Field::decode(item.value.as_slice())
+                                    .unwrap()
+                                    .name
+                                    != "Trial"
+                        });
+                        items[0] = konnect_ipc::builders::pack_any(
+                            &committed,
+                            "kiapi.board.types.FootprintInstance",
+                        );
+                    }
                     return Some(konnect_ipc::builders::pack_any(
                         &kiapi::common::commands::EndCommitResponse {},
                         "kiapi.common.commands.EndCommitResponse",
@@ -4181,7 +5498,7 @@ mod tests {
             "dry_run": false,
             "expected_plan_revision": dry_run["plan_revision"],
         });
-        let applied = (tool.handler)(&apply, context).await.unwrap();
+        let applied = (tool.handler)(&apply, context.clone()).await.unwrap();
         let applied: serde_json::Value = serde_json::from_str(&match &applied.content[0] {
             ToolContent::Text { text } => text.clone(),
             _ => panic!("sync response was not JSON text"),
@@ -4211,6 +5528,37 @@ mod tests {
         let after =
             kiapi::board::types::FootprintInstance::decode(footprints_after[0].value.as_slice())
                 .expect("captured R1 after apply");
+        let mut expected_field = footprint_field_slots(&before).unwrap()["custom.Trial"].clone();
+        expected_field
+            .text
+            .as_mut()
+            .unwrap()
+            .text
+            .as_mut()
+            .unwrap()
+            .text = "after".to_string();
+        assert_eq!(
+            footprint_field_slots(&after).unwrap()["custom.Trial"],
+            expected_field,
+            "the served ECO changes nested text without replacing the field's IDs or presentation"
+        );
+        assert_eq!(after.symbol_path, before.symbol_path);
+        let pads = |footprint: &kiapi::board::types::FootprintInstance| {
+            footprint
+                .definition
+                .as_ref()
+                .unwrap()
+                .items
+                .iter()
+                .filter(|item| konnect_ipc::builders::any_is(item, "kiapi.board.types.Pad"))
+                .cloned()
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(
+            pads(&after),
+            pads(&before),
+            "the served field/value ECO preserves pad Any payloads"
+        );
         let before = board_footprint_from_instance(&before).expect("R1 identity before apply");
         let after = board_footprint_from_instance(&after).expect("R1 identity after apply");
         assert_eq!(before.value, "1k");
@@ -4233,6 +5581,70 @@ mod tests {
             zones_after, zones_before,
             "the copper zone and keep-out/rule area must retain their complete protobuf identity and geometry"
         );
+
+        // A second real handler apply commits the new value, then the mock
+        // loses a field on publication. This is not a rejected/no-op preflight.
+        std::fs::write(
+            &exported,
+            netlist_with_fields(r#"(fields (field (name "Trial") "after-committed"))"#)
+                .replace("Resistor_SMD:R_0603_1608Metric", "Resistor_SMD:R_0402")
+                .replace("/Power/VCC", "VCC")
+                .replace("(value \"10k\")", "(value \"22k\")"),
+        )
+        .unwrap();
+        let review = (tool.handler)(&paths, context.clone()).await.unwrap();
+        let review: serde_json::Value = serde_json::from_str(&match &review.content[0] {
+            ToolContent::Text { text } => text.clone(),
+            _ => panic!("sync response was not JSON text"),
+        })
+        .unwrap();
+        assert_eq!(review["status"], "ready", "{review:#}");
+        lose_field_after_commit.store(true, Ordering::SeqCst);
+        let failed = (tool.handler)(
+            &serde_json::json!({
+                "schematic": schematic.to_string_lossy(),
+                "board": board.to_string_lossy(),
+                "dry_run": false,
+                "expected_plan_revision": review["plan_revision"],
+            }),
+            context,
+        )
+        .await
+        .unwrap();
+        assert!(
+            failed.is_error,
+            "post-commit field loss must not report success"
+        );
+        let failed: serde_json::Value = serde_json::from_str(&match &failed.content[0] {
+            ToolContent::Text { text } => text.clone(),
+            _ => panic!("sync error was not JSON text"),
+        })
+        .unwrap();
+        assert_eq!(failed["error"]["kind"], "ipc_outcome_unknown", "{failed:#}");
+        assert_eq!(failed["error"]["board_state"], "committed");
+        assert_eq!(failed["error"]["retry_safe"], false);
+        assert!(
+            failed.get("coverage").is_none(),
+            "do not invent preflight applied=0 counts after publication"
+        );
+        assert!(failed["message"].as_str().unwrap().contains("native Undo"));
+        assert!(!failed.to_string().contains("preflight_conflict"));
+        assert!(
+            !lose_field_after_commit.load(Ordering::SeqCst),
+            "EndCommit published the second mutation"
+        );
+        let committed = kiapi::board::types::FootprintInstance::decode(
+            state.footprints.lock().unwrap()[0].value.as_slice(),
+        )
+        .unwrap();
+        assert_eq!(
+            field_text(&committed.value_field),
+            "22k",
+            "the update really was published"
+        );
+        assert!(!board_field_values(&committed)
+            .unwrap()
+            .contains_key("Trial"));
     }
 
     // ─── #657: name what cannot be prepared, and let `ready` mean ready ──────
@@ -4290,12 +5702,160 @@ mod tests {
             footprint_id: footprint_id.to_string(),
             symbol_path: format!("/{reference}-uuid"),
             dnp: false,
+            fields: BTreeMap::new(),
             pad_nets: pads
                 .iter()
                 .map(|pad| (pad.to_string(), format!("{reference}-{pad}")))
                 .collect(),
             position: Point { x: 0.0, y: 0.0 },
         }
+    }
+
+    #[test]
+    fn additions_keep_stock_metadata_models_and_field_presentation_under_schematic_overlays() {
+        use konnect_ipc::gen::kiapi;
+        let (_temp, board) = project_with_stock_footprints();
+        let source = exported_netlist(&[("C1", STOCK_0603, &["1", "2"])]).replace(
+            "(sheetpath",
+            r#"
+                (fields
+                    (field (name "Trial") "headless")
+                    (field (name "CircuitNote") "Illustrative 5 V; not hardware-qualified")
+                    (field (name "Datasheet"))
+                    (field (name "Description") "schematic description"))
+                (property (name "Sheetname") (value "do not import"))
+                (property (name "dnp"))
+                (sheetpath"#,
+        );
+        let design = parse_exported_netlist(&source).unwrap();
+        let mut plan = plan_sync(&source, &design, &board_with(vec![]));
+        assert!(
+            matches!(&plan.changes[0], PlannedChange::Add { fields, .. } if fields == &design.components[0].fields)
+        );
+        let (prepared, unprepared) = prepare_additions(&board, &plan);
+        assert!(unprepared.is_empty(), "{unprepared:?}");
+        restage_additions(&mut plan, &prepared, board_with(vec![]).bounds);
+        let snapshot = LiveSnapshot {
+            state: board_with(vec![]),
+            items: BTreeMap::new(),
+            net_codes: BTreeMap::from([("C1-1".to_string(), 7)]),
+            document: Default::default(),
+        };
+        let (creates, updates) = build_mutation_items(&plan, &prepared, &snapshot).unwrap();
+        assert!(updates.is_empty());
+        assert_eq!(creates.len(), 1);
+        let instance =
+            kiapi::board::types::FootprintInstance::decode(creates[0].value.as_slice()).unwrap();
+        let PlannedChange::Add { position, .. } = &plan.changes[0] else {
+            panic!("the stock footprint must be added");
+        };
+        let stock =
+            build_import_instance(&prepared[STOCK_0603].library, position.x, position.y).unwrap();
+        let slots = footprint_field_slots(&instance).unwrap();
+        for (slot, field) in footprint_field_slots(&stock).unwrap() {
+            let mut expected = field;
+            let value = match expected.name.as_str() {
+                "Reference" => "C1",
+                "Value" => "part",
+                _ => validated_field_value(&expected).unwrap(),
+            }
+            .to_string();
+            expected.text.as_mut().unwrap().text.as_mut().unwrap().text = value;
+            assert_eq!(
+                slots[&slot], expected,
+                "stock field presentation must survive {slot}"
+            );
+        }
+        assert_eq!(
+            slots["custom.KiLib_Generator"]
+                .text
+                .as_ref()
+                .unwrap()
+                .text
+                .as_ref()
+                .unwrap()
+                .text,
+            "SMD_2terminal_chip_molded"
+        );
+        let values = board_field_values(&instance).unwrap();
+        for (name, value) in &design.components[0].fields {
+            assert_eq!(values.get(name), Some(value), "schematic field {name}");
+        }
+        assert!(!values.contains_key("Sheetname"));
+        assert!(!values.contains_key("dnp"));
+        for name in ["Trial", "CircuitNote"] {
+            let field = &slots[&format!("custom.{name}")];
+            assert!(field.id.is_none() && !field.visible);
+            let text = field.text.as_ref().unwrap();
+            assert!(text.id.is_none() && text.parent.is_none());
+            assert_eq!(text.text.as_ref().unwrap().position, instance.position);
+        }
+        let definition = instance.definition.as_ref().unwrap();
+        assert_eq!(
+            definition.attributes.as_ref().unwrap().description,
+            stock
+                .definition
+                .as_ref()
+                .unwrap()
+                .attributes
+                .as_ref()
+                .unwrap()
+                .description
+        );
+        assert_eq!(
+            definition.attributes.as_ref().unwrap().keywords,
+            "capacitor"
+        );
+        assert!(instance.attributes.as_ref().unwrap().do_not_populate);
+        assert!(definition.attributes.as_ref().unwrap().do_not_populate);
+        assert_eq!(
+            instance.attributes.as_ref().unwrap().mounting_style,
+            kiapi::board::types::FootprintMountingStyle::FmsSmd as i32
+        );
+        let artwork_and_models = |footprint: &kiapi::board::types::FootprintInstance| {
+            footprint
+                .definition
+                .as_ref()
+                .unwrap()
+                .items
+                .iter()
+                .filter(|item| {
+                    !konnect_ipc::builders::any_is(item, "kiapi.board.types.Pad")
+                        && !konnect_ipc::builders::any_is(item, "kiapi.board.types.Field")
+                })
+                .cloned()
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(artwork_and_models(&instance), artwork_and_models(&stock));
+        assert_eq!(
+            child_types(&creates[0])["kiapi.board.types.Footprint3DModel"],
+            1
+        );
+        assert_eq!(child_types(&creates[0])["kiapi.board.types.Field"], 3);
+        assert_eq!(
+            footprint_shapes(creates.iter())["C1"],
+            FootprintShape {
+                pads: 2,
+                drawings: 5
+            }
+        );
+        let view = board_footprint_from_instance(&{
+            let mut with_id = instance.clone();
+            with_id.id = Some(kiapi::common::types::Kiid {
+                value: "created-uuid".to_string(),
+            });
+            with_id
+        })
+        .unwrap();
+        assert_eq!(view.symbol_path.as_deref(), Some("/C1-uuid"));
+        assert_eq!(view.pad_nets, design.components[0].pad_nets);
+        let first_pad = definition
+            .items
+            .iter()
+            .find(|item| konnect_ipc::builders::any_is(item, "kiapi.board.types.Pad"))
+            .unwrap();
+        let first_pad = kiapi::board::types::Pad::decode(first_pad.value.as_slice()).unwrap();
+        assert_eq!(first_pad.net.unwrap().code.unwrap().value, 7);
     }
 
     fn plan_adding(changes: Vec<PlannedChange>) -> SyncPlan {
@@ -4351,7 +5911,7 @@ mod tests {
         assert!(
             texas.message.contains(TEXAS_VQFN)
                 && texas.message.contains("U1, U2")
-                && texas.message.contains("custom-shape pads"),
+                && texas.message.contains("pad shape 'custom'"),
             "{}",
             texas.message
         );
@@ -4674,6 +6234,61 @@ mod tests {
         }
     }
 
+    #[tokio::test]
+    async fn library_metadata_drift_changes_the_reviewed_revision_and_refuses_a_stale_apply() {
+        let served = ServedSync::new().await;
+        let source = exported_netlist(&[("C1", STOCK_0603, &["1", "2"])]);
+        let first = served.dry_run(&source).await;
+        assert_eq!(first["status"], "ready", "{first:#}");
+        let library = served
+            .board
+            .parent()
+            .unwrap()
+            .join("Capacitor_SMD.pretty/C_0603_1608Metric.kicad_mod");
+        let stock = include_str!("../../tests/fixtures/c_0603_1608metric_kicad10.kicad_mod");
+        std::fs::write(
+            library,
+            stock.replace("(tags \"capacitor\")", "(tags \"changed-metadata\")"),
+        )
+        .unwrap();
+        let second = served.dry_run(&source).await;
+        assert_eq!(second["status"], "ready", "{second:#}");
+        assert_eq!(
+            first["changes"], second["changes"],
+            "metadata drift need not move staging or schematic values"
+        );
+        assert_ne!(
+            first["plan_revision"], second["plan_revision"],
+            "the source digest is part of the reviewed revision"
+        );
+        let response = served
+            .handler
+            .handle_message(serde_json::json!({
+                "jsonrpc": "2.0",
+                "id": 658,
+                "method": "tools/call",
+                "params": {
+                    "name": "update_pcb_from_schematic",
+                    "arguments": {
+                        "schematic": served.schematic.to_string_lossy(),
+                        "board": served.board.to_string_lossy(),
+                        "dry_run": false,
+                        "expected_plan_revision": first["plan_revision"],
+                    }
+                }
+            }))
+            .await
+            .unwrap();
+        let result = response.result.unwrap();
+        let refused: serde_json::Value =
+            serde_json::from_str(result["content"][0]["text"].as_str().unwrap()).unwrap();
+        assert_eq!(refused["status"], "conflict", "{refused:#}");
+        assert_eq!(refused["diagnostics"][0]["code"], "stale_plan_revision");
+        assert_eq!(refused["changes"], serde_json::json!([]));
+        assert_eq!(refused["coverage"]["footprints_added"]["applied"], 0);
+        assert!(refused["undo"].is_null());
+    }
+
     /// #688 through the served boundary: a part the board lacks is staged
     /// 5 mm to the right of what KiCad holds, measured item by item.
     ///
@@ -4699,6 +6314,51 @@ mod tests {
         assert!(x > 155.0 && x < 165.0, "staged at x = {x}: {plan:#}");
         // Stacked down from the board's top edge (80 mm), not from y = 0.
         assert!(y > 80.0 && y < 90.0, "staged at y = {y}: {plan:#}");
+    }
+
+    #[tokio::test]
+    async fn a_partial_reference_without_effects_refuses_the_served_dry_run_before_ready() {
+        let served = ServedSync::new().await;
+        let stock = include_str!("../../tests/fixtures/c_0603_1608metric_kicad10.kicad_mod");
+        let reference_start = stock.find("(property \"Reference\"").unwrap();
+        let value_start = stock.find("(property \"Value\"").unwrap();
+        let partial = format!(
+            "{}(property \"Reference\" \"REF**\" (at 0 -1.43 0) (layer \"F.SilkS\"))\n{}",
+            &stock[..reference_start],
+            &stock[value_start..],
+        );
+        parse_library_footprint(STOCK_0603, &partial)
+            .expect("partial mandatory presentation remains a valid refresh input");
+        std::fs::write(
+            served
+                .board
+                .parent()
+                .unwrap()
+                .join("Capacitor_SMD.pretty/C_0603_1608Metric.kicad_mod"),
+            partial,
+        )
+        .unwrap();
+
+        let refused = served
+            .dry_run(&exported_netlist(&[("C1", STOCK_0603, &["1", "2"])]))
+            .await;
+        assert_eq!(refused["status"], "conflict", "{refused:#}");
+        assert_eq!(refused["changes"], serde_json::json!([]));
+        assert_eq!(refused["coverage"]["footprints_added"]["planned"], 0);
+        assert_eq!(refused["coverage"]["conflicts"]["planned"], 1);
+        let diagnostics = refused["diagnostics"].as_array().unwrap();
+        assert_eq!(diagnostics.len(), 1, "{refused:#}");
+        assert_eq!(diagnostics[0]["code"], "unsupported_library_footprint");
+        assert_eq!(diagnostics[0]["footprint_id"], STOCK_0603);
+        assert_eq!(diagnostics[0]["reference"], "C1");
+        assert_eq!(diagnostics[0]["references"], serde_json::json!(["C1"]));
+        let message = diagnostics[0]["message"].as_str().unwrap();
+        assert!(
+            message.contains("partial mandatory presentation")
+                && message.contains("Reference")
+                && message.contains("effects"),
+            "{message}"
+        );
     }
 
     /// #657 through the served boundary. The run that found it needed two
@@ -4728,8 +6388,8 @@ mod tests {
                 {
                     "code": "unsupported_library_footprint",
                     "message": format!(
-                        "{TEXAS_VQFN} cannot be placed (needed by U1, U2): custom-shape pads \
-                         are not supported by KiCad 10's typed placement path"
+                        "{TEXAS_VQFN} cannot be placed (needed by U1, U2): pad shape 'custom' \
+                         is not supported by typed library refresh"
                     ),
                     "reference": null,
                     "references": ["U1", "U2"],
@@ -4738,8 +6398,8 @@ mod tests {
                 {
                     "code": "unsupported_library_footprint",
                     "message": format!(
-                        "{GENERIC_VQFN} cannot be placed (needed by U3): custom-shape pads \
-                         are not supported by KiCad 10's typed placement path"
+                        "{GENERIC_VQFN} cannot be placed (needed by U3): pad shape 'custom' \
+                         is not supported by typed library refresh"
                     ),
                     "reference": "U3",
                     "references": ["U3"],

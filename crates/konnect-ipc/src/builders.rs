@@ -7,7 +7,8 @@ use crate::gen::kiapi;
 
 /// Converts millimeters to KiCAD nanometers.
 pub fn mm_to_nm(mm: f64) -> i64 {
-    (mm * 1_000_000.0) as i64
+    // Decimal library dimensions can land just below an integer in binary floating point.
+    (mm * 1_000_000.0).round() as i64
 }
 
 /// Converts KiCAD nanometers to millimeters.
@@ -700,6 +701,28 @@ pub fn board_text_with_stroke_width(
 pub(crate) mod tests {
     use super::*;
     use kiapi::common::types::graphic_shape::Geometry;
+
+    #[test]
+    fn millimetres_round_to_the_nearest_nanometre() {
+        for (mm, nm) in [
+            (1.025, 1_025_000),
+            (-1.025, -1_025_000),
+            (0.9125, 912_500),
+            (2.54, 2_540_000),
+            (0.000_000_49, 0),
+            (0.000_000_51, 1),
+            (-0.000_000_49, 0),
+            (-0.000_000_51, -1),
+        ] {
+            assert_eq!(mm_to_nm(mm), nm, "{mm} mm");
+            assert_eq!(distance(mm).value_nm, nm);
+            assert_eq!(vec2(mm, -mm).x_nm, nm);
+            assert_eq!(vec2(mm, -mm).y_nm, -nm);
+        }
+        for nm in -10_000..=10_000 {
+            assert_eq!(mm_to_nm(nm_to_mm(nm)), nm);
+        }
+    }
 
     /// `layer_name` is the exact inverse of `layer_from_name` over every
     /// representable layer — computed runs included. The forward map was

@@ -14,15 +14,17 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::path::Path;
 
 #[derive(Debug, Clone)]
-struct LibraryFootprint {
+pub(super) struct LibraryFootprint {
     library_id: String,
     definition: kiapi::board::types::Footprint,
     attributes: kiapi::board::types::FootprintAttributes,
     datasheet: Option<String>,
     description_field: Option<String>,
     properties: Vec<kiapi::board::types::Field>,
-    pads: Vec<konnect_ipc::IpcPadDefinition>,
-    graphics: Vec<konnect_ipc::IpcGraphicDefinition>,
+    partial_mandatory_properties: Vec<String>,
+    pub(super) pads: Vec<konnect_ipc::IpcPadDefinition>,
+    pub(super) graphics: Vec<konnect_ipc::IpcGraphicDefinition>,
+    pub(super) source_digest: [u8; 32],
     models: Vec<kiapi::board::types::Footprint3DModel>,
 }
 
@@ -30,6 +32,8 @@ struct LibraryFootprint {
 struct ParsedLibraryProperties {
     datasheet: Option<String>,
     description: Option<String>,
+    mandatory: BTreeMap<String, kiapi::board::types::Field>,
+    partial_mandatory_properties: Vec<String>,
     custom: Vec<kiapi::board::types::Field>,
 }
 
@@ -730,7 +734,7 @@ fn plan_updates(
     }
 }
 
-fn parse_library_footprint(library_id: &str, source: &str) -> Result<LibraryFootprint> {
+pub(super) fn parse_library_footprint(library_id: &str, source: &str) -> Result<LibraryFootprint> {
     let (library_nickname, entry_name) = library_id
         .split_once(':')
         .filter(|(nickname, entry)| !nickname.is_empty() && !entry.is_empty())
@@ -741,7 +745,7 @@ fn parse_library_footprint(library_id: &str, source: &str) -> Result<LibraryFoot
     }
 
     validate_supported_children(&root)?;
-    let properties = parse_library_properties(&root)?;
+    let mut properties = parse_library_properties(&root)?;
     let pads = super::pcb_components::extract_pad_definitions(source)?;
     // Custom properties travel as typed Field items below. Treating visible
     // properties as generic graphics as well would duplicate their text.
@@ -758,6 +762,10 @@ fn parse_library_footprint(library_id: &str, source: &str) -> Result<LibraryFoot
             keywords: root.find_str("tags").unwrap_or_default().to_string(),
             ..Default::default()
         }),
+        reference_field: properties.mandatory.remove("Reference"),
+        value_field: properties.mandatory.remove("Value"),
+        datasheet_field: properties.mandatory.remove("Datasheet"),
+        description_field: properties.mandatory.remove("Description"),
         ..Default::default()
     };
 
@@ -768,8 +776,10 @@ fn parse_library_footprint(library_id: &str, source: &str) -> Result<LibraryFoot
         datasheet: properties.datasheet,
         description_field: properties.description,
         properties: properties.custom,
+        partial_mandatory_properties: properties.partial_mandatory_properties,
         pads,
         graphics,
+        source_digest: Sha256::digest(source.as_bytes()).into(),
         models,
     })
 }
@@ -778,6 +788,8 @@ fn parse_library_properties(root: &konnect_sexp::SexpNode) -> Result<ParsedLibra
     let mut names = BTreeSet::new();
     let mut datasheet = None;
     let mut description = None;
+    let mut mandatory_fields = BTreeMap::new();
+    let mut partial_mandatory_properties = Vec::new();
     let mut custom = Vec::new();
     for property in root.find_all("property") {
         let name = property
@@ -788,27 +800,47 @@ fn parse_library_properties(root: &konnect_sexp::SexpNode) -> Result<ParsedLibra
             bail!("property '{name}' appears more than once in the library footprint");
         }
 
-        // Mandatory and custom properties share one lossless clause validator.
-        // The mandatory values keep their existing first-class IPC fields; the
-        // shared parser proves that none of their authored clauses would be
-        // silently ignored without requiring a typed custom Field.
+        // Fresh imports need the authored mandatory presentation; refreshes
+        // retain the placed fields. Sparse mandatory properties still validate
+        // for refresh, but partial presentation must refuse a fresh import.
         let mandatory = matches!(name, "Reference" | "Value" | "Datasheet" | "Description");
         let parsed = parse_library_property(property, !mandatory)?;
         let value = property
             .get(2)
             .and_then(konnect_sexp::SexpNode::as_str)
             .with_context(|| format!("property '{name}' is missing its value"))?;
-        match name {
-            "Reference" | "Value" => {}
-            "Datasheet" => datasheet = Some(value.to_string()),
-            "Description" => description = Some(value.to_string()),
-            _ => custom.push(parsed.context("custom property did not produce a typed field")?),
+        if mandatory {
+            if let Some(field) = parsed {
+                mandatory_fields.insert(name.to_string(), field);
+            } else if property
+                .children()
+                .unwrap_or_default()
+                .iter()
+                .skip(3)
+                .any(|clause| {
+                    matches!(
+                        clause.head(),
+                        Some("at" | "layer" | "effects" | "hide" | "knockout" | "unlocked")
+                    )
+                })
+            {
+                partial_mandatory_properties.push(name.to_string());
+            }
+            match name {
+                "Datasheet" => datasheet = Some(value.to_string()),
+                "Description" => description = Some(value.to_string()),
+                _ => {}
+            }
+        } else {
+            custom.push(parsed.context("custom property did not produce a typed field")?);
         }
     }
 
     Ok(ParsedLibraryProperties {
         datasheet,
         description,
+        mandatory: mandatory_fields,
+        partial_mandatory_properties,
         custom,
     })
 }
@@ -837,6 +869,7 @@ fn parse_library_property(
     let mut layer = None;
     let mut hidden = None;
     let mut knockout = None;
+    let mut unlocked = None;
     let mut attributes = None;
     let mut identifier = None;
 
@@ -895,6 +928,12 @@ fn parse_library_property(
                 }
                 knockout = Some(property_yes_no(clause, name, "knockout")?);
             }
+            "unlocked" => {
+                if unlocked.is_some() {
+                    bail!("property '{name}' contains duplicate 'unlocked' clauses");
+                }
+                unlocked = Some(property_yes_no(clause, name, "unlocked")?);
+            }
             "uuid" | "tstamp" => {
                 if let Some(previous) = identifier {
                     bail!(
@@ -923,7 +962,7 @@ fn parse_library_property(
         }
     }
 
-    if !require_typed_field {
+    if !require_typed_field && (position.is_none() || layer.is_none() || attributes.is_none()) {
         return Ok(None);
     }
 
@@ -936,6 +975,9 @@ fn parse_library_property(
     attributes.angle = Some(kiapi::common::types::Angle {
         value_degrees: rotation,
     });
+    // PCB field text uses `(unlocked yes)` to disable keep-upright, independently
+    // of the item's editing lock. Omission means upright (see the native capture).
+    attributes.keep_upright = !unlocked.unwrap_or(false);
     Ok(Some(kiapi::board::types::Field {
         id: None,
         name: name.to_string(),
@@ -1548,6 +1590,130 @@ fn parse_models(
         .collect()
 }
 
+fn populate_library_definition_metadata(
+    definition: &mut kiapi::board::types::Footprint,
+    library: &LibraryFootprint,
+) {
+    definition.attributes = library.definition.attributes.clone();
+    definition.items.extend(
+        library.models.iter().map(|model| {
+            konnect_ipc::builders::pack_any(model, "kiapi.board.types.Footprint3DModel")
+        }),
+    );
+}
+
+/// Construct a fresh front-side, unrotated stock instance. Schematic sync must
+/// overlay reference/value, DNP, pad nets and symbol path before sending it.
+/// Unlike refresh, this uses library presentation and leaves board IDs unset.
+/// Value-only mandatory properties may use defaults; partial presentation
+/// refuses rather than silently replacing supplied clauses.
+pub(super) fn build_import_instance(
+    library: &LibraryFootprint,
+    x: f64,
+    y: f64,
+) -> Result<kiapi::board::types::FootprintInstance> {
+    if !x.is_finite() || !y.is_finite() {
+        bail!("footprint import position must be finite");
+    }
+    if !library.partial_mandatory_properties.is_empty() {
+        bail!(
+            "footprint import refuses partial mandatory presentation for {}; provide 'at', 'layer', and 'effects' together",
+            library.partial_mandatory_properties.join(", ")
+        );
+    }
+    let (_, entry_name) = library
+        .library_id
+        .split_once(':')
+        .context("footprint identifier must use Library:Footprint syntax")?;
+    let packed = konnect_ipc::KiCadIpcClient::build_footprint_item(
+        &library.library_id,
+        "REF**",
+        entry_name,
+        &library.pads,
+        &library.graphics,
+        &Default::default(),
+        x,
+        y,
+        0.0,
+        "F.Cu",
+    )?;
+    let mut instance = kiapi::board::types::FootprintInstance::decode(packed.value.as_slice())
+        .context("typed footprint builder returned an invalid item")?;
+    let position = *instance
+        .position
+        .as_ref()
+        .context("typed footprint builder returned no position")?;
+    let definition = instance
+        .definition
+        .as_mut()
+        .context("typed footprint builder returned no definition")?;
+    populate_library_definition_metadata(definition, library);
+    for (name, template, instance_field, definition_field, value) in [
+        (
+            "Reference",
+            &library.definition.reference_field,
+            &mut instance.reference_field,
+            &mut definition.reference_field,
+            None,
+        ),
+        (
+            "Value",
+            &library.definition.value_field,
+            &mut instance.value_field,
+            &mut definition.value_field,
+            None,
+        ),
+        (
+            "Datasheet",
+            &library.definition.datasheet_field,
+            &mut instance.datasheet_field,
+            &mut definition.datasheet_field,
+            library.datasheet.as_deref(),
+        ),
+        (
+            "Description",
+            &library.definition.description_field,
+            &mut instance.description_field,
+            &mut definition.description_field,
+            library.description_field.as_deref(),
+        ),
+    ] {
+        if let Some(template) = template {
+            let placed = transform_library_property(template, &position, 0.0, false, false)?;
+            *instance_field = Some(placed.clone());
+            *definition_field = Some(placed);
+        } else if let Some(value) = value {
+            // Value-only mandatory metadata has no authored presentation.
+            // Use the existing text builder, not a partial Field.
+            if instance_field.is_none() {
+                let field = kiapi::board::types::Field {
+                    name: name.to_string(),
+                    visible: false,
+                    text: Some(konnect_ipc::builders::board_text(
+                        "F.Fab", value, x, y, 1.0, 0.0, false,
+                    )),
+                    ..Default::default()
+                };
+                *instance_field = Some(field.clone());
+                *definition_field = Some(field);
+            }
+        }
+        apply_field_value(instance_field, value);
+        apply_field_value(definition_field, value);
+    }
+    merge_custom_properties(
+        definition,
+        &Default::default(),
+        &library.properties,
+        &position,
+        0.0,
+        false,
+        false,
+    )?;
+    instance.attributes = Some(library.attributes.clone());
+    Ok(instance)
+}
+
 fn build_updated_instance(
     current: &kiapi::board::types::FootprintInstance,
     library: &LibraryFootprint,
@@ -1650,7 +1816,7 @@ fn build_updated_instance(
     let mut definition = built
         .definition
         .context("typed footprint builder returned no definition")?;
-    definition.attributes = library.definition.attributes.clone();
+    populate_library_definition_metadata(&mut definition, library);
     definition.reference_field = current_definition.reference_field.clone();
     definition.value_field = current_definition.value_field.clone();
     definition.datasheet_field = current_definition.datasheet_field.clone();
@@ -1662,11 +1828,6 @@ fn build_updated_instance(
     apply_field_value(
         &mut definition.description_field,
         library.description_field.as_deref(),
-    );
-    definition.items.extend(
-        library.models.iter().map(|model| {
-            konnect_ipc::builders::pack_any(model, "kiapi.board.types.Footprint3DModel")
-        }),
     );
     for item in &mut definition.items {
         if item.type_url.ends_with("kiapi.board.types.Pad") {
@@ -1701,6 +1862,7 @@ fn build_updated_instance(
         &position,
         rotation,
         is_back,
+        true,
     )?;
     updated.definition = Some(definition);
     apply_field_value(&mut updated.datasheet_field, library.datasheet.as_deref());
@@ -1744,12 +1906,13 @@ fn merge_custom_properties(
     footprint_position: &kiapi::common::types::Vector2,
     footprint_rotation: f64,
     is_back: bool,
+    normalize_upright_angle: bool,
 ) -> Result<()> {
     let library_names = library_properties
         .iter()
         .map(|field| field.name.as_str())
         .collect::<BTreeSet<_>>();
-    let mut current_names = BTreeSet::new();
+    let mut current_fields = BTreeMap::new();
     for item in current
         .items
         .iter()
@@ -1760,7 +1923,10 @@ fn merge_custom_properties(
         if field.name.is_empty() {
             bail!("board footprint contains a custom property without a name");
         }
-        if !current_names.insert(field.name.clone()) {
+        if current_fields
+            .insert(field.name.clone(), field.clone())
+            .is_some()
+        {
             bail!(
                 "board footprint contains more than one custom property named '{}'",
                 field.name
@@ -1773,8 +1939,23 @@ fn merge_custom_properties(
         }
     }
     for property in library_properties {
-        let property =
-            transform_library_property(property, footprint_position, footprint_rotation, is_back)?;
+        let mut property = transform_library_property(
+            property,
+            footprint_position,
+            footprint_rotation,
+            is_back,
+            normalize_upright_angle,
+        )?;
+        // Library IDs are cleared by the transform, but a same-named placed
+        // field keeps its board identity when its library presentation changes.
+        if let Some(current_field) = current_fields.get(&property.name) {
+            property.id = current_field.id;
+            if let (Some(text), Some(current_text)) =
+                (property.text.as_mut(), current_field.text.as_ref())
+            {
+                text.id = current_text.id.clone();
+            }
+        }
         updated.items.push(konnect_ipc::builders::pack_any(
             &property,
             "kiapi.board.types.Field",
@@ -1788,6 +1969,7 @@ fn transform_library_property(
     footprint_position: &kiapi::common::types::Vector2,
     footprint_rotation: f64,
     is_back: bool,
+    normalize_upright_angle: bool,
 ) -> Result<kiapi::board::types::Field> {
     let mut property = property.clone();
     property.id = None;
@@ -1832,8 +2014,14 @@ fn transform_library_property(
     } else {
         local_angle
     };
+    // Upright drawing is independent of the stored angle on fresh imports;
+    // only refresh retains the existing readable-angle normalization.
     attributes.angle = Some(kiapi::common::types::Angle {
-        value_degrees: readable_property_angle(local_angle + footprint_rotation),
+        value_degrees: if normalize_upright_angle && attributes.keep_upright {
+            readable_property_angle(local_angle + footprint_rotation)
+        } else {
+            local_angle + footprint_rotation
+        },
     });
     if is_back {
         attributes.mirrored = !attributes.mirrored;
@@ -2606,6 +2794,42 @@ mod tests {
             .collect()
     }
 
+    fn decoded_models(
+        instance: &kiapi::board::types::FootprintInstance,
+    ) -> Vec<kiapi::board::types::Footprint3DModel> {
+        instance
+            .definition
+            .as_ref()
+            .unwrap()
+            .items
+            .iter()
+            .filter(|item| builders::any_is(item, "kiapi.board.types.Footprint3DModel"))
+            .map(|item| {
+                kiapi::board::types::Footprint3DModel::decode(item.value.as_slice()).unwrap()
+            })
+            .collect()
+    }
+
+    fn translated_field(
+        template: &kiapi::board::types::Field,
+        position: &kiapi::common::types::Vector2,
+    ) -> kiapi::board::types::Field {
+        let mut field = template.clone();
+        let local = field
+            .text
+            .as_mut()
+            .unwrap()
+            .text
+            .as_mut()
+            .unwrap()
+            .position
+            .as_mut()
+            .unwrap();
+        local.x_nm += position.x_nm;
+        local.y_nm += position.y_nm;
+        field
+    }
+
     fn decoded_custom_fields(
         instance: &kiapi::board::types::FootprintInstance,
     ) -> Vec<kiapi::board::types::Field> {
@@ -2662,6 +2886,518 @@ mod tests {
         assert_eq!(model.offset.as_ref().unwrap().x_nm, 1.0);
         assert_eq!(model.scale.as_ref().unwrap().x_nm, -1.0);
         assert_eq!(model.rotation.as_ref().unwrap().z_nm, 45.0);
+    }
+
+    #[test]
+    fn property_upright_flags_match_kicad10_syntax_and_ipc_capture() {
+        let board = konnect_sexp::parse_sexp(include_str!(
+            "../../../konnect-ipc/tests/fixtures/live_ipc.kicad_pcb"
+        ))
+        .unwrap();
+        let source = board
+            .find_all("footprint")
+            .into_iter()
+            .find(|footprint| {
+                footprint.find_all("property").iter().any(|property| {
+                    property.get(1).and_then(konnect_sexp::SexpNode::as_str) == Some("Reference")
+                        && property.get(2).and_then(konnect_sexp::SexpNode::as_str) == Some("MH1")
+                })
+            })
+            .expect("the native capture's source footprint must be present");
+        let parsed = parse_library_properties(source).unwrap();
+        let captured = kiapi::board::types::FootprintInstance::decode(
+            include_bytes!("../../tests/fixtures/board_only_footprint.ipc.bin").as_slice(),
+        )
+        .unwrap();
+
+        for (name, captured_field) in [
+            ("Reference", &captured.reference_field),
+            ("Value", &captured.value_field),
+            ("Datasheet", &captured.datasheet_field),
+            ("Description", &captured.description_field),
+        ] {
+            let authored = source
+                .find_all("property")
+                .into_iter()
+                .find(|property| {
+                    property.get(1).and_then(konnect_sexp::SexpNode::as_str) == Some(name)
+                })
+                .unwrap();
+            let captured_attributes = captured_field
+                .as_ref()
+                .unwrap()
+                .text
+                .as_ref()
+                .unwrap()
+                .text
+                .as_ref()
+                .unwrap()
+                .attributes
+                .as_ref()
+                .unwrap();
+            let parsed_attributes = parsed.mandatory[name]
+                .text
+                .as_ref()
+                .unwrap()
+                .text
+                .as_ref()
+                .unwrap()
+                .attributes
+                .as_ref()
+                .unwrap();
+            assert_eq!(
+                captured_attributes.keep_upright,
+                authored.find_str("unlocked") != Some("yes"),
+                "the retained native capture establishes the syntax for {name}"
+            );
+            assert_eq!(
+                parsed_attributes.keep_upright, captured_attributes.keep_upright,
+                "{name} must retain native keep-upright semantics"
+            );
+        }
+    }
+
+    #[test]
+    fn fresh_import_keeps_stock_metadata_models_and_mandatory_presentation() {
+        for (library_id, source) in [
+            (
+                "Capacitor_SMD:C_0603_1608Metric",
+                include_str!("../../tests/fixtures/c_0603_1608metric_kicad10.kicad_mod"),
+            ),
+            ("Test:Socket", KICAD_LIBRARY_FOOTPRINT),
+        ] {
+            let source_root = konnect_sexp::parse_sexp(source).unwrap();
+            let library = parse_library_footprint(library_id, source).unwrap();
+            let templates = library.definition.clone();
+            let expected_digest: [u8; 32] = Sha256::digest(source.as_bytes()).into();
+            assert_eq!(library.source_digest, expected_digest);
+            let imported = build_import_instance(&library, 32.0, 16.0).unwrap();
+            let position = builders::vec2(32.0, 16.0);
+            let definition = imported.definition.as_ref().unwrap();
+
+            assert!(imported.id.is_none());
+            assert!(imported.symbol_path.is_none());
+            assert_eq!(imported.position.as_ref(), Some(&position));
+            assert_eq!(imported.orientation.as_ref().unwrap().value_degrees, 0.0);
+            assert_eq!(
+                imported.layer,
+                kiapi::board::types::BoardLayer::BlFCu as i32
+            );
+            assert_eq!(imported.attributes.as_ref(), Some(&library.attributes));
+            assert_eq!(
+                imported.attributes.as_ref().unwrap().mounting_style,
+                kiapi::board::types::FootprintMountingStyle::FmsSmd as i32
+            );
+            assert_eq!(definition.id, templates.id);
+            assert_eq!(definition.attributes, templates.attributes);
+            let metadata = definition.attributes.as_ref().unwrap();
+            assert!(!metadata.description.is_empty());
+            assert!(!metadata.keywords.is_empty());
+            assert_eq!(decoded_models(&imported), library.models);
+            assert_eq!(decoded_models(&imported).len(), 1);
+
+            for (name, template, instance_field, definition_field) in [
+                (
+                    "Reference",
+                    &templates.reference_field,
+                    &imported.reference_field,
+                    &definition.reference_field,
+                ),
+                (
+                    "Value",
+                    &templates.value_field,
+                    &imported.value_field,
+                    &definition.value_field,
+                ),
+                (
+                    "Datasheet",
+                    &templates.datasheet_field,
+                    &imported.datasheet_field,
+                    &definition.datasheet_field,
+                ),
+                (
+                    "Description",
+                    &templates.description_field,
+                    &imported.description_field,
+                    &definition.description_field,
+                ),
+            ] {
+                let authored = source_root.find_all("property").iter().any(|property| {
+                    property.get(1).and_then(konnect_sexp::SexpNode::as_str) == Some(name)
+                });
+                if !authored {
+                    assert!(template.is_none());
+                    assert!(instance_field.is_none());
+                    assert!(definition_field.is_none());
+                    continue;
+                }
+                let template = template
+                    .as_ref()
+                    .expect("authored mandatory properties must retain complete templates");
+                let expected = translated_field(template, &position);
+                assert_eq!(instance_field.as_ref(), Some(&expected));
+                assert_eq!(definition_field, instance_field);
+                assert!(expected.id.is_none());
+                assert!(expected.text.as_ref().unwrap().id.is_none());
+            }
+            let expected_properties = library
+                .properties
+                .iter()
+                .map(|property| translated_field(property, &position))
+                .collect::<Vec<_>>();
+            let properties = decoded_custom_fields(&imported);
+            assert_eq!(properties, expected_properties);
+            assert!(
+                !properties
+                    .iter()
+                    .find(|field| field.name == "KiLib_Generator")
+                    .unwrap()
+                    .visible
+            );
+            assert_eq!(decoded_pads(&imported).len(), library.pads.len());
+            assert!(decoded_pads(&imported)
+                .iter()
+                .all(|pad| pad.id.is_none() && pad.net.is_none()));
+            assert_eq!(
+                definition
+                    .items
+                    .iter()
+                    .filter(|item| builders::any_is(item, "kiapi.board.types.BoardText"))
+                    .count(),
+                library
+                    .graphics
+                    .iter()
+                    .filter(|graphic| {
+                        matches!(graphic, konnect_ipc::IpcGraphicDefinition::Text { .. })
+                    })
+                    .count(),
+                "properties must not also be packed as generic text"
+            );
+            assert_eq!(
+                library.definition, templates,
+                "placement must not mutate templates"
+            );
+        }
+    }
+
+    #[test]
+    fn fresh_import_keeps_tht_attributes_and_ordered_model_transforms() {
+        let source = KICAD_LIBRARY_FOOTPRINT
+            .replace(
+                "(attr smd exclude_from_pos_files)",
+                "(attr through_hole exclude_from_pos_files)",
+            )
+            .replace(
+                "\t(model \"../models/Socket.step\"",
+                "\t(model \"../models/Hidden.step\" hide\n\t\t(offset (xyz 4 5 6))\n\t\t(scale (xyz 2 3 4))\n\t\t(rotate (xyz 10 20 30))\n\t\t(opacity 0.4)\n\t)\n\t(model \"../models/Socket.step\"",
+            );
+        assert_ne!(source, KICAD_LIBRARY_FOOTPRINT);
+        let library = parse_library_footprint("Test:Socket", &source).unwrap();
+        let imported = build_import_instance(&library, 10.0, 20.0).unwrap();
+        assert_eq!(
+            imported.attributes.as_ref().unwrap().mounting_style,
+            kiapi::board::types::FootprintMountingStyle::FmsThroughHole as i32
+        );
+        let models = decoded_models(&imported);
+        assert_eq!(models, library.models);
+        assert_eq!(models.len(), 2);
+        assert_eq!(models[0].filename, "../models/Hidden.step");
+        assert!(!models[0].visible);
+        assert_eq!(models[0].opacity, 0.4);
+        assert_eq!(models[0].offset.as_ref().unwrap().y_nm, 5.0);
+        assert_eq!(models[0].scale.as_ref().unwrap().z_nm, 4.0);
+        assert_eq!(models[0].rotation.as_ref().unwrap().x_nm, 10.0);
+        assert_eq!(models[1].filename, "../models/Socket.step");
+        assert_eq!(models[1].offset.as_ref().unwrap().x_nm, 1.0);
+        assert_eq!(models[1].scale.as_ref().unwrap().x_nm, -1.0);
+        assert_eq!(models[1].rotation.as_ref().unwrap().z_nm, 45.0);
+    }
+
+    #[test]
+    fn sparse_mandatory_templates_keep_refresh_compatibility_and_import_defaults() {
+        let library = parse_library_footprint("Test:Socket", LIBRARY_FOOTPRINT).unwrap();
+        assert!(library.definition.reference_field.is_none());
+        assert!(library.definition.value_field.is_none());
+        assert!(library.definition.datasheet_field.is_none());
+        assert!(library.definition.description_field.is_none());
+        let current = current_instance(kiapi::board::types::BoardLayer::BlFCu);
+        let prepared =
+            build_updated_instance(&current, &library, &BTreeMap::new(), &BTreeSet::new()).unwrap();
+        let refreshed =
+            kiapi::board::types::FootprintInstance::decode(prepared.item.value.as_slice()).unwrap();
+        assert_eq!(refreshed.reference_field, current.reference_field);
+        assert_eq!(refreshed.value_field, current.value_field);
+        let error = build_import_instance(&library, 10.0, 20.0).unwrap_err();
+        assert!(error.to_string().contains("Datasheet"));
+        assert!(error.to_string().contains("Description"));
+
+        let value_only_source = LIBRARY_FOOTPRINT
+            .replace(" (at 0 0) (layer \"F.Fab\") (hide yes)", "")
+            .replace(
+                "  (descr \"updated description\")",
+                "  (property \"Reference\" \"REF**\")\n  (property \"Value\" \"Socket\")\n  (descr \"updated description\")",
+            );
+        assert_ne!(value_only_source, LIBRARY_FOOTPRINT);
+        let value_only_library =
+            parse_library_footprint("Test:Socket", &value_only_source).unwrap();
+        assert!(value_only_library.partial_mandatory_properties.is_empty());
+        let imported = build_import_instance(&value_only_library, 10.0, 20.0).unwrap();
+        assert_eq!(field_text(&imported.reference_field), "REF**");
+        assert_eq!(field_text(&imported.value_field), "Socket");
+        assert_eq!(field_text(&imported.datasheet_field), "new-datasheet.pdf");
+        assert_eq!(
+            field_text(&imported.description_field),
+            "new field description"
+        );
+        for field in [&imported.datasheet_field, &imported.description_field] {
+            let field = field.as_ref().unwrap();
+            assert!(!field.visible);
+            let text = field.text.as_ref().unwrap();
+            assert_eq!(text.layer, kiapi::board::types::BoardLayer::BlFFab as i32);
+            assert_eq!(
+                text.text.as_ref().unwrap().position.as_ref(),
+                Some(&builders::vec2(10.0, 20.0))
+            );
+            assert!(text.text.as_ref().unwrap().attributes.is_some());
+        }
+    }
+
+    #[test]
+    fn import_refuses_partial_mandatory_presentation_without_changing_refresh() {
+        let value_only_source =
+            LIBRARY_FOOTPRINT.replace(" (at 0 0) (layer \"F.Fab\") (hide yes)", "");
+        for presentation in [
+            "(at 1 -4 180) (layer \"F.Fab\") (hide yes)",
+            "(at 1 -4 180) (hide yes) (effects (font (size 1 1)))",
+            "(layer \"F.Fab\") (hide yes) (effects (font (size 1 1)))",
+            "(hide yes)",
+            "(unlocked yes)",
+            "(knockout yes)",
+        ] {
+            let source = value_only_source.replace(
+                "  (descr \"updated description\")",
+                &format!(
+                    "  (property \"Reference\" \"REF**\" {presentation})\n  (descr \"updated description\")"
+                ),
+            );
+            assert_ne!(source, value_only_source);
+            let library = parse_library_footprint("Test:Socket", &source).unwrap();
+            assert!(library.definition.reference_field.is_none());
+            assert_eq!(
+                library.partial_mandatory_properties,
+                vec!["Reference".to_string()]
+            );
+            let error = build_import_instance(&library, 10.0, 20.0).unwrap_err();
+            assert!(error.to_string().contains("partial mandatory presentation"));
+            assert!(error.to_string().contains("Reference"));
+
+            let current = current_instance(kiapi::board::types::BoardLayer::BlFCu);
+            let prepared =
+                build_updated_instance(&current, &library, &BTreeMap::new(), &BTreeSet::new())
+                    .unwrap();
+            let refreshed =
+                kiapi::board::types::FootprintInstance::decode(prepared.item.value.as_slice())
+                    .unwrap();
+            assert_eq!(refreshed.reference_field, current.reference_field);
+            assert_eq!(refreshed.value_field, current.value_field);
+        }
+    }
+
+    #[test]
+    fn refresh_preserves_placed_mandatory_presentation_and_field_identities() {
+        let mut current = current_instance(kiapi::board::types::BoardLayer::BlBCu);
+        for (index, slot) in [
+            &mut current.reference_field,
+            &mut current.value_field,
+            &mut current.datasheet_field,
+            &mut current.description_field,
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let field = slot.as_mut().unwrap();
+            field.id = Some(kiapi::board::types::FieldId { id: index as i32 });
+            let text = field.text.as_mut().unwrap();
+            text.id = Some(kiapi::common::types::Kiid {
+                value: format!("placed-field-{index}"),
+            });
+            let attributes = text.text.as_mut().unwrap().attributes.as_mut().unwrap();
+            attributes.font_name = "placed font".to_string();
+            attributes.line_spacing = 1.25;
+            attributes.bold = true;
+            attributes.keep_upright = index % 2 == 0;
+        }
+        let definition = current.definition.as_mut().unwrap();
+        definition.reference_field = current.reference_field.clone();
+        definition.value_field = current.value_field.clone();
+        definition.datasheet_field = current.datasheet_field.clone();
+        definition.description_field = current.description_field.clone();
+        let library = parse_library_footprint("Test:Socket", KICAD_LIBRARY_FOOTPRINT).unwrap();
+        let prepared =
+            build_updated_instance(&current, &library, &BTreeMap::new(), &BTreeSet::new()).unwrap();
+        let refreshed =
+            kiapi::board::types::FootprintInstance::decode(prepared.item.value.as_slice()).unwrap();
+        let definition = refreshed.definition.as_ref().unwrap();
+        for (original, instance_field, definition_field, replacement) in [
+            (
+                &current.reference_field,
+                &refreshed.reference_field,
+                &definition.reference_field,
+                None,
+            ),
+            (
+                &current.value_field,
+                &refreshed.value_field,
+                &definition.value_field,
+                None,
+            ),
+            (
+                &current.datasheet_field,
+                &refreshed.datasheet_field,
+                &definition.datasheet_field,
+                library.datasheet.as_deref(),
+            ),
+            (
+                &current.description_field,
+                &refreshed.description_field,
+                &definition.description_field,
+                library.description_field.as_deref(),
+            ),
+        ] {
+            let mut expected = original.clone();
+            apply_field_value(&mut expected, replacement);
+            assert_eq!(instance_field, &expected);
+            assert_eq!(definition_field, &expected);
+        }
+        assert_eq!(refreshed.id, current.id);
+        assert_eq!(refreshed.position, current.position);
+        assert_eq!(refreshed.orientation, current.orientation);
+        assert_eq!(refreshed.layer, current.layer);
+        assert_eq!(refreshed.locked, current.locked);
+        assert_eq!(refreshed.symbol_path, current.symbol_path);
+        assert_eq!(refreshed.overrides, current.overrides);
+        assert_eq!(
+            refreshed.attributes.as_ref().unwrap().do_not_populate,
+            current.attributes.as_ref().unwrap().do_not_populate
+        );
+        assert_eq!(decoded_models(&refreshed), library.models);
+    }
+
+    #[test]
+    fn fresh_import_keeps_upright_authored_angles_without_wrapping() {
+        for angle in [180.0, 540.0, -180.0, -540.0] {
+            let source = KICAD_LIBRARY_FOOTPRINT
+                .replace("(at 0 -4 0)", &format!("(at 0 -4 {angle})"))
+                .replace("(at 0 4 0)", &format!("(at 0 4 {angle})"))
+                .replace("(at 0 0 0)", &format!("(at 0 0 {angle})"))
+                .replace("(at 0.5 0.75 15)", &format!("(at 0.5 0.75 {angle})"));
+            assert_ne!(source, KICAD_LIBRARY_FOOTPRINT);
+            let library = parse_library_footprint("Test:Socket", &source).unwrap();
+            let imported = build_import_instance(&library, 10.0, 20.0).unwrap();
+            let definition = imported.definition.as_ref().unwrap();
+            let properties = decoded_custom_fields(&imported);
+            assert_eq!(properties.len(), library.properties.len());
+            for field in [
+                imported.reference_field.as_ref().unwrap(),
+                imported.value_field.as_ref().unwrap(),
+                imported.datasheet_field.as_ref().unwrap(),
+                imported.description_field.as_ref().unwrap(),
+                definition.reference_field.as_ref().unwrap(),
+                definition.value_field.as_ref().unwrap(),
+                definition.datasheet_field.as_ref().unwrap(),
+                definition.description_field.as_ref().unwrap(),
+            ]
+            .into_iter()
+            .chain(properties.iter())
+            {
+                let attributes = field
+                    .text
+                    .as_ref()
+                    .unwrap()
+                    .text
+                    .as_ref()
+                    .unwrap()
+                    .attributes
+                    .as_ref()
+                    .unwrap();
+                assert!(
+                    attributes.keep_upright,
+                    "{} must remain upright",
+                    field.name
+                );
+                assert_eq!(
+                    attributes.angle.as_ref().unwrap().value_degrees,
+                    angle,
+                    "{} must retain its authored stored angle",
+                    field.name
+                );
+            }
+
+            let current = current_instance(kiapi::board::types::BoardLayer::BlFCu);
+            let prepared =
+                build_updated_instance(&current, &library, &BTreeMap::new(), &BTreeSet::new())
+                    .unwrap();
+            let refreshed =
+                kiapi::board::types::FootprintInstance::decode(prepared.item.value.as_slice())
+                    .unwrap();
+            let refreshed_properties = decoded_custom_fields(&refreshed);
+            assert_eq!(refreshed_properties.len(), library.properties.len());
+            for field in refreshed_properties {
+                let attributes = field
+                    .text
+                    .as_ref()
+                    .unwrap()
+                    .text
+                    .as_ref()
+                    .unwrap()
+                    .attributes
+                    .as_ref()
+                    .unwrap();
+                assert!(attributes.keep_upright);
+                assert_eq!(
+                    attributes.angle.as_ref().unwrap().value_degrees,
+                    37.0,
+                    "{} must retain the previous refresh normalization",
+                    field.name
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn unlocked_property_retains_its_authored_angle_on_import() {
+        let source = KICAD_LIBRARY_FOOTPRINT.replace(
+            "\t\t(at 0.5 0.75 15)",
+            "\t\t(at 0.5 0.75 180)\n\t\t(unlocked yes)",
+        );
+        assert_ne!(source, KICAD_LIBRARY_FOOTPRINT);
+        let library = parse_library_footprint("Test:Socket", &source).unwrap();
+        let imported = build_import_instance(&library, 10.0, 20.0).unwrap();
+        let fields = decoded_custom_fields(&imported);
+        let attributes = fields
+            .iter()
+            .find(|field| field.name == "AssemblyVendor")
+            .unwrap()
+            .text
+            .as_ref()
+            .unwrap()
+            .text
+            .as_ref()
+            .unwrap()
+            .attributes
+            .as_ref()
+            .unwrap();
+        assert!(!attributes.keep_upright);
+        assert_eq!(attributes.angle.as_ref().unwrap().value_degrees, 180.0);
+    }
+
+    #[test]
+    fn import_refuses_nonfinite_positions() {
+        let library = parse_library_footprint("Test:Socket", KICAD_LIBRARY_FOOTPRINT).unwrap();
+        for coordinate in [f64::NAN, f64::INFINITY, f64::NEG_INFINITY] {
+            assert!(build_import_instance(&library, coordinate, 0.0).is_err());
+            assert!(build_import_instance(&library, 0.0, coordinate).is_err());
+        }
     }
 
     #[test]
@@ -2813,7 +3549,12 @@ mod tests {
     fn merge_preserves_instance_only_properties_and_refreshes_library_properties() {
         let mut current = current_instance(kiapi::board::types::BoardLayer::BlFCu);
         let instance_only = field("InstanceNote", "keep this", 105.0, 55.0, false);
-        let stale_library_property = field("AssemblyVendor", "old library value", 99.0, 49.0, true);
+        let mut stale_library_property =
+            field("AssemblyVendor", "old library value", 99.0, 49.0, true);
+        stale_library_property.id = Some(kiapi::board::types::FieldId { id: 4 });
+        stale_library_property.text.as_mut().unwrap().id = Some(kiapi::common::types::Kiid {
+            value: "placed-assembly-vendor".to_string(),
+        });
         current.definition.as_mut().unwrap().items.extend([
             builders::pack_any(&instance_only, "kiapi.board.types.Field"),
             builders::pack_any(&stale_library_property, "kiapi.board.types.Field"),
@@ -2845,14 +3586,15 @@ mod tests {
                 .unwrap(),
             &instance_only
         );
+        let refreshed_property = properties
+            .iter()
+            .find(|property| property.name == "AssemblyVendor")
+            .unwrap();
+        assert_eq!(field_text_value(refreshed_property), "Example Assembly");
+        assert_eq!(refreshed_property.id, stale_library_property.id);
         assert_eq!(
-            field_text_value(
-                properties
-                    .iter()
-                    .find(|property| property.name == "AssemblyVendor")
-                    .unwrap()
-            ),
-            "Example Assembly"
+            refreshed_property.text.as_ref().unwrap().id,
+            stale_library_property.text.as_ref().unwrap().id
         );
         assert!(prepared.changed_domains.contains(&ChangedDomain::Metadata));
     }
@@ -2893,13 +3635,13 @@ mod tests {
     fn parser_names_unrepresentable_or_ambiguous_custom_properties() {
         let unsupported = KICAD_LIBRARY_FOOTPRINT.replace(
             "\t(property \"AssemblyVendor\" \"Example Assembly\"\n\t\t(at",
-            "\t(property \"AssemblyVendor\" \"Example Assembly\"\n\t\t(unlocked yes)\n\t\t(at",
+            "\t(property \"AssemblyVendor\" \"Example Assembly\"\n\t\t(unsupported yes)\n\t\t(at",
         );
         assert_ne!(unsupported, KICAD_LIBRARY_FOOTPRINT);
         let error = parse_library_footprint("Test:Socket", &unsupported).unwrap_err();
         let message = error.to_string();
         assert!(message.contains("AssemblyVendor"), "{message}");
-        assert!(message.contains("unlocked"), "{message}");
+        assert!(message.contains("unsupported"), "{message}");
 
         let duplicate = KICAD_LIBRARY_FOOTPRINT.replace(
             "\"KiLib_Generator\" \"konnect_test_generator\"",
@@ -2924,7 +3666,7 @@ mod tests {
             let authored = format!("\t(property \"{name}\" \"{value}\"\n\t\t(at");
             let unsupported = KICAD_LIBRARY_FOOTPRINT.replace(
                 &authored,
-                &format!("\t(property \"{name}\" \"{value}\"\n\t\t(unlocked yes)\n\t\t(at"),
+                &format!("\t(property \"{name}\" \"{value}\"\n\t\t(unsupported yes)\n\t\t(at"),
             );
             assert_ne!(unsupported, KICAD_LIBRARY_FOOTPRINT);
             match parse_library_footprint("Test:Socket", &unsupported) {
@@ -2932,7 +3674,7 @@ mod tests {
                 Err(error) => {
                     let message = error.to_string();
                     assert!(message.contains(name), "{message}");
-                    assert!(message.contains("unlocked"), "{message}");
+                    assert!(message.contains("unsupported"), "{message}");
                 }
             }
 
@@ -2966,6 +3708,10 @@ mod tests {
             (
                 "knockout",
                 format!("{vendor_prefix}\n\t\t(knockout yes)\n\t\t(knockout no)"),
+            ),
+            (
+                "unlocked",
+                format!("{vendor_prefix}\n\t\t(unlocked yes)\n\t\t(unlocked no)"),
             ),
         ] {
             let repeated = KICAD_LIBRARY_FOOTPRINT.replace(vendor_prefix, &replacement);
@@ -3290,7 +4036,7 @@ mod tests {
         let (temp, board, items) = plan_fixture();
         let unsupported = KICAD_LIBRARY_FOOTPRINT.replace(
             "\t(property \"AssemblyVendor\" \"Example Assembly\"\n\t\t(at",
-            "\t(property \"AssemblyVendor\" \"Example Assembly\"\n\t\t(unlocked yes)\n\t\t(at",
+            "\t(property \"AssemblyVendor\" \"Example Assembly\"\n\t\t(unsupported yes)\n\t\t(at",
         );
         std::fs::write(
             temp.path().join("Test.pretty/Socket.kicad_mod"),
@@ -3312,7 +4058,7 @@ mod tests {
         assert!(plan.diagnostics.iter().any(|diagnostic| {
             diagnostic.code == "unsupported_library_footprint"
                 && diagnostic.message.contains("AssemblyVendor")
-                && diagnostic.message.contains("unlocked")
+                && diagnostic.message.contains("unsupported")
         }));
     }
 
