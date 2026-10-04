@@ -146,6 +146,40 @@ The queue is only legible if claims are visible.
 - Priority labels `P0`/`P1`/`P2` and `area:*` labels are how the queue is read
   at a glance. Keep them current.
 
+## Proportionate scope review
+
+Address the demonstrated problem in supported workflows with the smallest
+coherent solution. Additional edge-case handling requires observed demand or a
+credible material safety, data-loss, or security risk. Prefer a clear refusal,
+warning, documented limitation, or explicit caller input over speculative
+inference or broad compatibility machinery. A rare trigger can still justify a
+small shared correctness fix; rarity alone is not a reason to reject it.
+
+During issue triage and PR review, distinguish the demonstrated defect from
+optional expansion. Keep acceptance criteria bounded to the agreed outcome;
+new variations need new evidence or an explicit scope decision. Use the
+risk-proportionate validation rule below for unavailable environments: missing
+secondary-environment evidence alone does not justify rejection.
+
+Apply `status:needs-scope-review` only when the implementation boundary requires
+a maintainer decision. It replaces the current `status:*` label and means the
+next actor is the maintainer, not the contributor. Leave one concise comment
+stating the decision needed, supported behavior, explicit exclusions, smallest
+acceptable fix, and decision owner. Chris retains product-scope decisions;
+routine boundaries follow the existing ownership model.
+
+Once the boundary is agreed, record it in the issue's acceptance criteria,
+remove the label, and apply the actual next-action status. Preserve priority,
+area, assignees, and existing claims unless evidence changes them. The label is
+neither `wontfix` nor a permanent architectural classification, and starts no
+closure timer. Unlike `architecture:kicad-replacement`, it can also identify an
+overbroad solution within an existing capability.
+
+This is a decision aid, not another gate on every small fix. An independently
+safe, scoped correction may proceed while broader expansion is deferred; a
+tracker's unfinished work is not automatically its dependency. Required CI,
+material safety evidence, and substantive review findings remain binding.
+
 ## Branches and the PR queue
 
 The detailed contributor workflow is in

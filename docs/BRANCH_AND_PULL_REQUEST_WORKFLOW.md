@@ -226,6 +226,8 @@ The next actor is represented by exactly one workflow label:
 
 - `status:waiting-on-author`: the contributor must change or clarify the PR;
 - `status:waiting-on-dependency`: another named change must land first;
+- `status:needs-scope-review`: a maintainer must decide the implementation
+  boundary under [proportionate scope review](../GOVERNANCE.md#proportionate-scope-review);
 - `status:waiting-on-review`: the focused current head is ready for review; and
 - `status:ready-to-merge`: review of this exact head is complete and only the
   repository gate or merge execution remains.
@@ -237,6 +239,10 @@ For the one next-to-land PR in an overlap set:
    author. Do not refresh deeper queued PRs.
 2. A maintainer verifies the head SHA, focused diff, dependency position,
    issue-closing references, evidence, and every resolved review conversation.
+   When the implementation boundary is unresolved, use the scope-review rule
+   above and record the smallest acceptable fix and deferred expansion. A scope
+   decision is maintainer work, not an author defect; keep independent safe fixes
+   moving without requiring completion of the broader tracker.
 3. If something remains, the maintainer applies the label for the actual next
    actor and leaves auto-merge off. A substantive review finding always means
    `status:waiting-on-author`, including on a PR authored by `@mixelpixx` or
