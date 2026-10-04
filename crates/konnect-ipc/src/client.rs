@@ -43,6 +43,17 @@ fn nm_to_mm(nm: i64) -> f64 {
     nm as f64 / 1_000_000.0
 }
 
+fn trace_dimension_nm(mm: f64, field: &str) -> Result<i64> {
+    // IPC uses int64, but KiCad's native board geometry uses signed int32 nm.
+    // Check before the builder's float-to-int cast can saturate or turn NaN into zero.
+    let nm = (mm * 1_000_000.0).round();
+    anyhow::ensure!(
+        mm.is_finite() && nm >= f64::from(i32::MIN) && nm <= f64::from(i32::MAX),
+        "{field} must be finite and fit KiCad's signed 32-bit nanometre geometry"
+    );
+    Ok(crate::builders::mm_to_nm(mm))
+}
+
 fn pad_type_name(value: i32) -> Option<String> {
     use kiapi::board::types::PadType;
     match PadType::try_from(value).ok()? {
@@ -2468,16 +2479,28 @@ impl KiCadIpcClient {
     pub fn begin_commit(&self) -> Result<String> {
         let cmd = kiapi::common::commands::BeginCommit {};
         let response_any = self.send_command(&cmd, "kiapi.common.commands.BeginCommit")?;
-        let response: kiapi::common::commands::BeginCommitResponse =
-            unpack_required(response_any, "BeginCommit")?;
-        let id = response
-            .id
-            .context("KiCad returned BeginCommit without a commit identifier")?
-            .value;
-        if id.is_empty() {
-            anyhow::bail!("KiCad returned an empty commit identifier");
-        }
-        Ok(id)
+        // AS_OK may have opened a transaction even if its payload is unusable.
+        (|| -> Result<String> {
+            let any = response_any.context("KiCad returned no BeginCommit response payload")?;
+            anyhow::ensure!(
+                crate::builders::any_is(&any, "kiapi.common.commands.BeginCommitResponse"),
+                "KiCad returned unexpected BeginCommit response type: {}",
+                any.type_url
+            );
+            let response: kiapi::common::commands::BeginCommitResponse = unpack_any(&any)?;
+            let id = response
+                .id
+                .context("KiCad returned BeginCommit without a commit identifier")?
+                .value;
+            anyhow::ensure!(!id.is_empty(), "KiCad returned an empty commit identifier");
+            Ok(id)
+        })()
+        .map_err(|error| {
+            error.context(IpcOutcomeUnknown {
+                command: "BeginCommit".into(),
+                reason: "AS_OK response did not establish a valid commit identifier".into(),
+            })
+        })
     }
 
     /// End a commit (push or drop).
@@ -2494,11 +2517,28 @@ impl KiCadIpcClient {
             action: action as i32,
             message: message.to_string(),
         };
-        let _: kiapi::common::commands::EndCommitResponse = unpack_required(
-            self.send_command(&cmd, "kiapi.common.commands.EndCommit")?,
-            "EndCommit",
-        )?;
-        Ok(())
+        let response_any = self.send_command(&cmd, "kiapi.common.commands.EndCommit")?;
+        // Publication or rollback may already have happened; never blindly drop
+        // a commit because an accepted boundary response cannot be validated.
+        (|| -> Result<()> {
+            let any = response_any.context("KiCad returned no EndCommit response payload")?;
+            anyhow::ensure!(
+                crate::builders::any_is(&any, "kiapi.common.commands.EndCommitResponse"),
+                "KiCad returned unexpected EndCommit response type: {}",
+                any.type_url
+            );
+            let _: kiapi::common::commands::EndCommitResponse = unpack_any(&any)?;
+            Ok(())
+        })()
+        .map_err(|error| {
+            error.context(IpcOutcomeUnknown {
+                command: "EndCommit".into(),
+                reason: format!(
+                    "AS_OK response did not confirm {} for commit {commit_id}",
+                    action.as_str_name()
+                ),
+            })
+        })
     }
 
     /// Push (commit) changes.
@@ -2967,6 +3007,146 @@ impl KiCadIpcClient {
             );
         }
         Ok(Some(track))
+    }
+
+    /// Read one straight Track from an exact document, preserving its complete
+    /// typed message. KOT_PCB_TRACE can also return vias/arcs: decode is never
+    /// used as the type discriminator.
+    pub fn get_trace_segment_in(
+        &self,
+        document: kiapi::common::types::DocumentSpecifier,
+        uuid: &str,
+    ) -> Result<Option<kiapi::board::types::Track>> {
+        if uuid.is_empty() {
+            return Ok(None);
+        }
+        let response = unpack_required::<kiapi::common::commands::GetItemsResponse>(
+            self.send_command(
+                &kiapi::common::commands::GetItems {
+                    header: Some(header_for(document.clone())),
+                    types: vec![kiapi::common::types::KiCadObjectType::KotPcbTrace as i32],
+                },
+                "kiapi.common.commands.GetItems",
+            )?,
+            "GetItems",
+        )?;
+        ensure_item_request_ok(response.status, "trace retrieval")?;
+        if let Some(header) = response.header {
+            anyhow::ensure!(
+                header.document.as_ref() == Some(&document),
+                "trace response names a different or missing document"
+            );
+            anyhow::ensure!(
+                header
+                    .field_mask
+                    .as_ref()
+                    .is_none_or(|mask| mask.paths.is_empty()),
+                "trace response is not a complete item preimage"
+            );
+        }
+        let mut found = None;
+        for item in response.items {
+            if !crate::builders::any_is(&item, "kiapi.board.types.Track") {
+                continue;
+            }
+            let track = kiapi::board::types::Track::decode(item.value.as_slice())
+                .context("decode straight trace segment")?;
+            if track.id.as_ref().is_some_and(|id| id.value == uuid) {
+                anyhow::ensure!(found.is_none(), "duplicate trace UUID '{uuid}' on board");
+                found = Some(track);
+            }
+        }
+        Ok(found)
+    }
+
+    /// Modify one observed straight trace in place as one recoverable native
+    /// commit. Only the named routing fields change; identity, lock and parent
+    /// come from the live preimage. None means no matching straight trace and
+    /// no mutation. On publication, return what was sent; the caller must prove
+    /// it with fresh typed readback before reporting success.
+    #[allow(clippy::too_many_arguments)]
+    pub fn modify_trace_segment(
+        &self,
+        requested: &Path,
+        uuid: &str,
+        net_name: &str,
+        layer: &str,
+        width: f64,
+        x1: f64,
+        y1: f64,
+        x2: f64,
+        y2: f64,
+    ) -> Result<Option<kiapi::board::types::Track>> {
+        use kiapi::board::types::BoardLayer;
+        use kiapi::common::types::{Distance, Vector2};
+
+        let width_nm = trace_dimension_nm(width, "width")?;
+        anyhow::ensure!(
+            width > 0.0 && width_nm > 0,
+            "width must be positive after nanometre quantization"
+        );
+        let start = Vector2 {
+            x_nm: trace_dimension_nm(x1, "x1")?,
+            y_nm: trace_dimension_nm(y1, "y1")?,
+        };
+        let end = Vector2 {
+            x_nm: trace_dimension_nm(x2, "x2")?,
+            y_nm: trace_dimension_nm(y2, "y2")?,
+        };
+        anyhow::ensure!(
+            start != end,
+            "trace segment must be nonzero after nanometre quantization"
+        );
+        let layer = crate::builders::try_layer_from_name(layer)?;
+        anyhow::ensure!(
+            (BoardLayer::BlFCu as i32..=BoardLayer::BlBCu as i32).contains(&(layer as i32)),
+            "trace layer must be copper"
+        );
+
+        let document = self.find_open_board(requested)?;
+        let Some(before) = self.get_trace_segment_in(document.clone(), uuid)? else {
+            return Ok(None);
+        };
+        anyhow::ensure!(
+            matches!(
+                before.locked(),
+                kiapi::common::types::LockedState::LsLocked
+                    | kiapi::common::types::LockedState::LsUnlocked
+            ),
+            "trace preimage does not report a known lock state; cannot preserve it safely"
+        );
+        let net_code = self.resolve_net_code_in(document.clone(), net_name)?;
+        anyhow::ensure!(
+            self.get_enabled_layers_in(document.clone())?
+                .layers
+                .iter()
+                .any(|enabled| enabled.id == layer as i32),
+            "trace layer is not enabled on the requested board"
+        );
+
+        let mut updated = before.clone();
+        updated.start = Some(start);
+        updated.end = Some(end);
+        updated.width = Some(Distance { value_nm: width_nm });
+        updated.layer = layer as i32;
+        updated.net = Some(crate::builders::net(net_name, net_code));
+        self.run_commit_recovering_in(document.clone(), "Modify trace", |client| {
+            anyhow::ensure!(
+                client
+                    .get_trace_segment_in(document.clone(), uuid)?
+                    .as_ref()
+                    == Some(&before),
+                "trace preimage changed during preparation; no update sent"
+            );
+            client.update_items_in(
+                document.clone(),
+                vec![crate::builders::pack_any(
+                    &updated,
+                    "kiapi.board.types.Track",
+                )],
+            )
+        })?;
+        Ok(Some(updated))
     }
 
     /// Delete a board item by UUID.
@@ -5366,6 +5546,39 @@ fn first_duplicate<'a>(paths: &[&'a PathBuf]) -> Option<&'a PathBuf> {
 }
 
 #[cfg(test)]
+mod trace_dimension_tests {
+    use super::*;
+
+    #[test]
+    fn rejects_nonfinite_and_native_geometry_overflow_before_casting() {
+        for mm in [
+            f64::NAN,
+            f64::INFINITY,
+            f64::NEG_INFINITY,
+            f64::MAX,
+            -f64::MAX,
+            2147.483648,
+            -2147.483649,
+        ] {
+            assert!(trace_dimension_nm(mm, "x1").is_err(), "accepted {mm}");
+        }
+    }
+
+    #[test]
+    fn uses_existing_nanometre_rounding_within_native_limits() {
+        for (mm, nm) in [
+            (1.0000004, 1_000_000),
+            (1.0000006, 1_000_001),
+            (-1.0000006, -1_000_001),
+            (2147.483647, i64::from(i32::MAX)),
+            (-2147.483648, i64::from(i32::MIN)),
+        ] {
+            assert_eq!(trace_dimension_nm(mm, "x1").unwrap(), nm);
+        }
+    }
+}
+
+#[cfg(test)]
 mod recovery_tests {
     use super::*;
     use nng::options::Options;
@@ -5386,6 +5599,18 @@ mod recovery_tests {
         WrongSnapshot,
         ObserveFailed,
         BeginLate,
+        BeginNoPayload,
+        BeginCorrupt,
+        BeginWrongType,
+        BeginWrongTypeSuffix,
+        BeginMissingId,
+        BeginEmptyId,
+        BeginRejected,
+        PublishNoPayload,
+        PublishCorrupt,
+        PublishWrongType,
+        PublishWrongTypeSuffix,
+        PublishRejected,
     }
 
     fn exercise(scenario: Scenario) -> (Result<()>, Vec<String>, Duration) {
@@ -5482,16 +5707,53 @@ mod recovery_tests {
                         }
                         response.message = Some(pack_any(
                             &kiapi::common::commands::BeginCommitResponse {
-                                id: Some(kiapi::common::types::Kiid {
-                                    value: "known-commit".into(),
-                                }),
+                                id: match scenario {
+                                    Scenario::BeginMissingId => None,
+                                    Scenario::BeginEmptyId => Some(kiapi::common::types::Kiid {
+                                        value: String::new(),
+                                    }),
+                                    _ => Some(kiapi::common::types::Kiid {
+                                        value: "known-commit".into(),
+                                    }),
+                                },
                             },
                             "kiapi.common.commands.BeginCommitResponse",
-                        ))
+                        ));
+                        match scenario {
+                            Scenario::BeginNoPayload => response.message = None,
+                            Scenario::BeginCorrupt => {
+                                response.message.as_mut().unwrap().value = vec![0xff];
+                            }
+                            Scenario::BeginWrongType => {
+                                response.message.as_mut().unwrap().type_url =
+                                    "type.googleapis.com/kiapi.common.commands.EndCommitResponse"
+                                        .into();
+                            }
+                            Scenario::BeginWrongTypeSuffix => {
+                                response.message.as_mut().unwrap().type_url =
+                                    "type.googleapis.com/foreign.kiapi.common.commands.BeginCommitResponse"
+                                        .into();
+                            }
+                            Scenario::BeginRejected => {
+                                response.status.as_mut().unwrap().status =
+                                    kiapi::common::ApiStatusCode::AsBadRequest as i32;
+                                response.message = None;
+                            }
+                            _ => {}
+                        }
                     }
                     "Ping" => {
                         mutated = true;
-                        if !matches!(scenario, Scenario::Success | Scenario::PublishLate) {
+                        if !matches!(
+                            scenario,
+                            Scenario::Success
+                                | Scenario::PublishLate
+                                | Scenario::PublishNoPayload
+                                | Scenario::PublishCorrupt
+                                | Scenario::PublishWrongType
+                                | Scenario::PublishWrongTypeSuffix
+                                | Scenario::PublishRejected
+                        ) {
                             std::thread::sleep(if matches!(scenario, Scenario::Exhausted) {
                                 Duration::from_millis(800)
                             } else {
@@ -5517,7 +5779,11 @@ mod recovery_tests {
                         if matches!(scenario, Scenario::CleanupSlow) {
                             std::thread::sleep(Duration::from_millis(480));
                         }
-                        if matches!(scenario, Scenario::DropFailed) {
+                        let publishing = command.action
+                            == kiapi::common::commands::CommitAction::CmaCommit as i32;
+                        if matches!(scenario, Scenario::DropFailed)
+                            || (publishing && matches!(scenario, Scenario::PublishRejected))
+                        {
                             response.status.as_mut().unwrap().status =
                                 kiapi::common::ApiStatusCode::AsBadRequest as i32;
                         } else if command.action
@@ -5529,6 +5795,27 @@ mod recovery_tests {
                             &kiapi::common::commands::EndCommitResponse {},
                             "kiapi.common.commands.EndCommitResponse",
                         ));
+                        if publishing {
+                            match scenario {
+                                Scenario::PublishNoPayload | Scenario::PublishRejected => {
+                                    response.message = None;
+                                }
+                                Scenario::PublishCorrupt => {
+                                    response.message.as_mut().unwrap().value = vec![0xff];
+                                }
+                                Scenario::PublishWrongType => {
+                                    response.message.as_mut().unwrap().type_url =
+                                        "type.googleapis.com/kiapi.common.commands.BeginCommitResponse"
+                                            .into();
+                                }
+                                Scenario::PublishWrongTypeSuffix => {
+                                    response.message.as_mut().unwrap().type_url =
+                                        "type.googleapis.com/foreign.kiapi.common.commands.EndCommitResponse"
+                                            .into();
+                                }
+                                _ => {}
+                            }
+                        }
                     }
                     other => panic!("unexpected {other}"),
                 }
@@ -5556,6 +5843,128 @@ mod recovery_tests {
         worker.join().unwrap();
         let calls = calls.lock().unwrap().clone();
         (result, calls, elapsed)
+    }
+
+    #[test]
+    fn accepted_begin_response_errors_never_enter_or_drop_the_batch() {
+        for scenario in [
+            Scenario::BeginNoPayload,
+            Scenario::BeginCorrupt,
+            Scenario::BeginWrongType,
+            Scenario::BeginWrongTypeSuffix,
+            Scenario::BeginMissingId,
+            Scenario::BeginEmptyId,
+        ] {
+            let (result, calls, _) = exercise(scenario);
+            let error = result.unwrap_err();
+            assert_eq!(
+                error
+                    .downcast_ref::<IpcOutcomeUnknown>()
+                    .map(|unknown| unknown.command.as_str()),
+                Some("BeginCommit"),
+                "{scenario:?}: {error:#}"
+            );
+            let failure = IpcFailure::from_error(error);
+            assert!(matches!(failure, IpcFailure::Uncertain(_)), "{failure:?}");
+            assert_eq!(
+                calls.iter().filter(|call| *call == "BeginCommit").count(),
+                1
+            );
+            assert!(
+                !calls
+                    .iter()
+                    .any(|call| call == "Ping" || call == "EndCommit"),
+                "{scenario:?}: {calls:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn accepted_publish_response_errors_never_retry_or_blindly_drop_the_batch() {
+        for scenario in [
+            Scenario::PublishNoPayload,
+            Scenario::PublishCorrupt,
+            Scenario::PublishWrongType,
+            Scenario::PublishWrongTypeSuffix,
+        ] {
+            let (result, calls, _) = exercise(scenario);
+            let error = result.unwrap_err();
+            assert_eq!(
+                error
+                    .downcast_ref::<IpcOutcomeUnknown>()
+                    .map(|unknown| unknown.command.as_str()),
+                Some("EndCommit"),
+                "{scenario:?}: {error:#}"
+            );
+            let failure = IpcFailure::from_error(error);
+            assert!(matches!(failure, IpcFailure::Uncertain(_)), "{failure:?}");
+            for name in ["BeginCommit", "Ping", "EndCommit"] {
+                assert_eq!(
+                    calls.iter().filter(|call| call.as_str() == name).count(),
+                    1,
+                    "{scenario:?}: {calls:?}"
+                );
+            }
+            assert_eq!(
+                calls
+                    .iter()
+                    .filter(|call| call.starts_with("action:"))
+                    .cloned()
+                    .collect::<Vec<_>>(),
+                vec![format!(
+                    "action:{}",
+                    kiapi::common::commands::CommitAction::CmaCommit as i32
+                )],
+                "{scenario:?}: {calls:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn explicit_boundary_api_refusals_remain_rejected() {
+        for scenario in [Scenario::BeginRejected, Scenario::PublishRejected] {
+            let (result, calls, _) = exercise(scenario);
+            let error = result.unwrap_err();
+            assert_eq!(
+                ApiStatusError::from_error(&error).map(|status| status.code),
+                Some(kiapi::common::ApiStatusCode::AsBadRequest as i32),
+                "{scenario:?}: {error:#}"
+            );
+            let failure = IpcFailure::from_error(error);
+            assert!(matches!(failure, IpcFailure::Rejected(_)), "{failure:?}");
+            assert_eq!(
+                calls.iter().filter(|call| *call == "BeginCommit").count(),
+                1
+            );
+            let publishing = matches!(scenario, Scenario::PublishRejected);
+            assert_eq!(
+                calls.iter().filter(|call| *call == "Ping").count(),
+                usize::from(publishing)
+            );
+            let expected_actions = if publishing {
+                vec![
+                    format!(
+                        "action:{}",
+                        kiapi::common::commands::CommitAction::CmaCommit as i32
+                    ),
+                    format!(
+                        "action:{}",
+                        kiapi::common::commands::CommitAction::CmaDrop as i32
+                    ),
+                ]
+            } else {
+                vec![]
+            };
+            assert_eq!(
+                calls
+                    .iter()
+                    .filter(|call| call.starts_with("action:"))
+                    .cloned()
+                    .collect::<Vec<_>>(),
+                expected_actions,
+                "{scenario:?}: {calls:?}"
+            );
+        }
     }
 
     #[test]

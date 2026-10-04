@@ -211,7 +211,7 @@ pub fn tools() -> Vec<ToolDef> {
         .with_board_access(crate::tools::BoardAccess::LiveOnly),
         tool!(
             "modify_trace",
-            "Modify a trace segment by deleting and re-adding it with new parameters.",
+            "Modify a straight trace segment in place via KiCad IPC, preserving its UUID and unspecified properties. Validates before writing, uses one native undo commit, and verifies fresh typed readback before reporting success.",
             json!({
                 "type": "object",
                 "properties": {
@@ -1245,6 +1245,7 @@ async fn handle_modify_trace(
     args: &serde_json::Value,
     ctx: &ToolContext,
 ) -> anyhow::Result<CallToolResult> {
+    let board = get_path(args, "board")?;
     let uuid = match require_str(args, "uuid") {
         Ok(v) => v.to_string(),
         Err(e) => return Ok(e),
@@ -1273,20 +1274,703 @@ async fn handle_modify_trace(
         Ok(v) => v,
         Err(e) => return Ok(e),
     };
-    let width = args["width"].as_f64().unwrap_or(0.25);
+    let width = if args.get("width").is_some() {
+        match require_f64(args, "width") {
+            Ok(v) => v,
+            Err(e) => return Ok(e),
+        }
+    } else {
+        0.25
+    };
 
-    let uuid_ipc = uuid.clone();
-    let net_ipc = net_name.clone();
-    let layer_ipc = layer.clone();
-    ipc!(ctx, args, |c| {
-        c.delete_track(&uuid_ipc)?;
-        c.add_track(&net_ipc, &layer_ipc, width, x1, y1, x2, y2)
-    });
-    Ok(CallToolResult::json(&json!({
-        "modified_uuid": uuid,
-        "net": net_name, "layer": layer, "width": width,
-        "from": { "x": x1, "y": y1 }, "to": { "x": x2, "y": y2 }
-    })))
+    let board_ipc = board.clone();
+    let result = with_board_ipc_classified(ctx, &board, move |client, document| {
+        let Some(mut expected) = client.modify_trace_segment(
+            &board_ipc, &uuid, &net_name, &layer, width, x1, y1, x2, y2,
+        )? else {
+            return Ok(CallToolResult::error_kind(
+                ToolErrorKind::StaleTarget {
+                    target: uuid,
+                    reason: "the UUID is not an observed straight trace on the requested board".into(),
+                },
+                "The requested UUID is not a straight trace on the requested board. No board item was modified.",
+            ));
+        };
+
+        // EndCommit has confirmed publication. Every error from here is a
+        // committed-but-unverified mutation, never a preflight refusal.
+        let verification = (|| -> anyhow::Result<CallToolResult> {
+            anyhow::ensure!(
+                client.find_open_board(&board_ipc)? == document,
+                "board target changed after committing trace modification"
+            );
+            let mut actual = client.get_trace_segment_in(document, &uuid)?
+                .context("modified UUID is absent from straight trace readback")?;
+            // KiCad 10's NetCode is deprecated: the name is authoritative, and
+            // serialization may omit the legacy code even when the net matches.
+            for track in [&mut actual, &mut expected] {
+                if let Some(net) = track.net.as_mut() {
+                    net.code = None;
+                }
+            }
+            anyhow::ensure!(actual == expected, "trace readback differs from the requested or preserved fields");
+            let layer = konnect_ipc::builders::layer_name(actual.layer());
+            let id = actual.id.context("trace readback has no UUID")?;
+            let net = actual.net.context("trace readback has no net")?;
+            let width = actual.width.context("trace readback has no width")?;
+            let start = actual.start.context("trace readback has no start")?;
+            let end = actual.end.context("trace readback has no end")?;
+            Ok(CallToolResult::json(&json!({
+                "modified_uuid": id.value,
+                "net": net.name,
+                "layer": layer,
+                "width": konnect_ipc::builders::nm_to_mm(width.value_nm),
+                "from": { "x": konnect_ipc::builders::nm_to_mm(start.x_nm), "y": konnect_ipc::builders::nm_to_mm(start.y_nm) },
+                "to": { "x": konnect_ipc::builders::nm_to_mm(end.x_nm), "y": konnect_ipc::builders::nm_to_mm(end.y_nm) },
+                "postcondition": "same_uuid_and_fields_verified"
+            })))
+        })();
+        Ok(verification.unwrap_or_else(|error| {
+            let reason = format!("KiCad committed the trace modification, but readback could not verify it: {error:#}");
+            CallToolResult::error_kind(
+                ToolErrorKind::IpcOutcomeUnknown {
+                    board_state: "committed".into(),
+                    retry_safe: false,
+                    reason: reason.clone(),
+                },
+                format!("{reason}. Do not repeat the mutation or edit the saved file. Inspect the requested live board; use KiCad's native Undo to reverse the committed update if needed. No automatic rollback was attempted."),
+            )
+        }))
+    }).await?;
+
+    Ok(match result {
+        Ok(result) => result,
+        Err(konnect_ipc::IpcFailure::Target { error, .. }) => {
+            crate::tools::ipc_target_error_result(&error)
+        }
+        Err(konnect_ipc::IpcFailure::Uncertain(message)) => {
+            crate::tools::ipc_uncertain_result(&message)
+        }
+        Err(konnect_ipc::IpcFailure::Recovered(message)) => {
+            crate::tools::ipc_recovered_result(&message)
+        }
+        Err(konnect_ipc::IpcFailure::Unreachable(reason)) => CallToolResult::error_kind(
+            ToolErrorKind::EditorUnavailable {
+                editor: "pcb".into(),
+                reason: reason.clone(),
+            },
+            format!("modify_trace requires the requested board open in KiCad: {reason}"),
+        ),
+        Err(konnect_ipc::IpcFailure::Rejected(reason)) => CallToolResult::error_kind(
+            ToolErrorKind::HandlerError {
+                reason: reason.clone(),
+            },
+            format!("modify_trace failed: {reason}"),
+        ),
+    })
+}
+
+#[cfg(test)]
+mod modify_trace_tests {
+    use super::*;
+    use crate::test_support::MockIpcServer;
+    use crate::tools::pcb_board::board_mock::{board_document, ctx_talking_to};
+    use konnect_ipc::builders::{self, pack_any};
+    use konnect_ipc::gen::kiapi;
+    use std::sync::{Arc, Mutex};
+
+    const UUID: &str = "existing-track";
+    const SAVED: &str = "(kicad_pcb (version 20260206))";
+
+    #[derive(Clone, Copy, Debug)]
+    enum Scenario {
+        Normal,
+        ReadbackCodeOmitted,
+        ReadbackAbsent,
+        ReadbackWrongType,
+        ReadbackChangedUuid,
+        ReadbackChangedNet,
+        ReadbackChanged,
+        ReadbackCorrupt,
+        ReadbackRejected,
+        ReadbackNoPayload,
+        ReadbackForeignBoard,
+        PublishUnknown,
+        UpdateRejected,
+        PreimageChanged,
+    }
+
+    struct State {
+        calls: Vec<String>,
+        updates: Vec<kiapi::board::types::Track>,
+        actions: Vec<i32>,
+        items: Vec<prost_types::Any>,
+        published: bool,
+    }
+
+    fn original_track() -> kiapi::board::types::Track {
+        let mut track = builders::build_track("GND", 7, "F.Cu", 0.4, 1.0, 2.0, 3.0, 4.0);
+        track.id = Some(kiapi::common::types::Kiid { value: UUID.into() });
+        track.locked = kiapi::common::types::LockedState::LsLocked as i32;
+        track.parent = Some(kiapi::common::types::Kiid {
+            value: "routing-group".into(),
+        });
+        track
+    }
+
+    fn args(board: &Path) -> serde_json::Value {
+        json!({
+            "board": board, "uuid": UUID, "net_name": "VCC", "layer": "B.Cu",
+            "x1": 10.0000004, "y1": -2.0, "x2": 20.0, "y2": 5.0
+        })
+    }
+
+    fn body(result: &CallToolResult) -> serde_json::Value {
+        match &result.content[0] {
+            crate::mcp::protocol::ToolContent::Text { text } => serde_json::from_str(text).unwrap(),
+            other => panic!("expected JSON text, got {other:?}"),
+        }
+    }
+
+    fn spawn_board(
+        board: &Path,
+        open_boards: &[&Path],
+        items: Vec<prost_types::Any>,
+        scenario: Scenario,
+    ) -> (MockIpcServer, Arc<Mutex<State>>) {
+        let target = board_document(&board.to_string_lossy());
+        let foreign = board_document(&board.with_file_name("foreign.kicad_pcb").to_string_lossy());
+        let documents: Vec<_> = open_boards
+            .iter()
+            .map(|board| board_document(&board.to_string_lossy()))
+            .collect();
+        let state = Arc::new(Mutex::new(State {
+            calls: Vec::new(),
+            updates: Vec::new(),
+            actions: Vec::new(),
+            items,
+            published: false,
+        }));
+        let observed = state.clone();
+        let server = MockIpcServer::spawn("modify-trace", move |request| {
+            let command = request.message.unwrap();
+            let name = command.type_url.rsplit('.').next().unwrap();
+            let bytes = command.value.as_slice();
+            let mut state = observed.lock().unwrap();
+            state.calls.push(name.into());
+            let mut response = kiapi::common::ApiResponse {
+                status: Some(kiapi::common::ApiResponseStatus {
+                    status: kiapi::common::ApiStatusCode::AsOk as i32,
+                    ..Default::default()
+                }),
+                ..Default::default()
+            };
+            response.message = match name {
+                "GetOpenDocuments" => Some(pack_any(
+                    &kiapi::common::commands::GetOpenDocumentsResponse {
+                        documents: documents.clone(),
+                    },
+                    "kiapi.common.commands.GetOpenDocumentsResponse",
+                )),
+                "GetItems" => {
+                    let request = kiapi::common::commands::GetItems::decode(bytes).unwrap();
+                    assert_eq!(
+                        request.header.as_ref().and_then(|h| h.document.as_ref()),
+                        Some(&target)
+                    );
+                    assert_eq!(
+                        request.types,
+                        vec![kiapi::common::types::KiCadObjectType::KotPcbTrace as i32]
+                    );
+                    let mut items = state.items.clone();
+                    let mut header = request.header;
+                    let mut status = kiapi::common::types::ItemRequestStatus::IrsOk as i32;
+                    if matches!(scenario, Scenario::PreimageChanged)
+                        && state.calls.iter().any(|name| name == "BeginCommit")
+                    {
+                        let mut changed = original_track();
+                        changed.locked = kiapi::common::types::LockedState::LsUnlocked as i32;
+                        items = vec![pack_any(&changed, "kiapi.board.types.Track")];
+                    }
+                    if state.published {
+                        match scenario {
+                            Scenario::ReadbackAbsent => items.clear(),
+                            // A compatible Track body under a Via type URL must not pass decode-as-type.
+                            Scenario::ReadbackWrongType => {
+                                items[0].type_url =
+                                    "type.googleapis.com/kiapi.board.types.Via".into()
+                            }
+                            Scenario::ReadbackCodeOmitted => {
+                                let mut changed = state.updates[0].clone();
+                                changed.net.as_mut().unwrap().code = None;
+                                items = vec![pack_any(&changed, "kiapi.board.types.Track")];
+                            }
+                            Scenario::ReadbackChangedNet => {
+                                let mut changed = state.updates[0].clone();
+                                changed.net.as_mut().unwrap().name = "GND".into();
+                                items = vec![pack_any(&changed, "kiapi.board.types.Track")];
+                            }
+                            Scenario::ReadbackChangedUuid => {
+                                let mut changed = state.updates[0].clone();
+                                changed.id.as_mut().unwrap().value = "replacement-track".into();
+                                items = vec![pack_any(&changed, "kiapi.board.types.Track")];
+                            }
+                            Scenario::ReadbackChanged => {
+                                let mut changed = state.updates[0].clone();
+                                changed.locked =
+                                    kiapi::common::types::LockedState::LsUnlocked as i32;
+                                items = vec![pack_any(&changed, "kiapi.board.types.Track")];
+                            }
+                            Scenario::ReadbackCorrupt => items[0].value = vec![0xff],
+                            Scenario::ReadbackRejected => {
+                                status =
+                                    kiapi::common::types::ItemRequestStatus::IrsDocumentNotFound
+                                        as i32
+                            }
+                            Scenario::ReadbackNoPayload => return response,
+                            Scenario::ReadbackForeignBoard => {
+                                header.as_mut().unwrap().document = Some(foreign.clone())
+                            }
+                            _ => {}
+                        }
+                    }
+                    Some(pack_any(
+                        &kiapi::common::commands::GetItemsResponse {
+                            header,
+                            status,
+                            items,
+                        },
+                        "kiapi.common.commands.GetItemsResponse",
+                    ))
+                }
+                "GetNets" => {
+                    let request = kiapi::board::commands::GetNets::decode(bytes).unwrap();
+                    assert_eq!(request.board.as_ref(), Some(&target));
+                    Some(pack_any(
+                        &kiapi::board::commands::NetsResponse {
+                            nets: vec![builders::net("GND", 7), builders::net("VCC", 42)],
+                        },
+                        "kiapi.board.commands.NetsResponse",
+                    ))
+                }
+                "GetBoardEnabledLayers" => {
+                    let request =
+                        kiapi::board::commands::GetBoardEnabledLayers::decode(bytes).unwrap();
+                    assert_eq!(request.board.as_ref(), Some(&target));
+                    Some(pack_any(
+                        &kiapi::board::commands::BoardEnabledLayersResponse {
+                            layers: vec![
+                                kiapi::board::types::BoardLayer::BlFCu as i32,
+                                kiapi::board::types::BoardLayer::BlBCu as i32,
+                                kiapi::board::types::BoardLayer::BlEdgeCuts as i32,
+                            ],
+                            copper_layer_count: 2,
+                        },
+                        "kiapi.board.commands.BoardEnabledLayersResponse",
+                    ))
+                }
+                "SaveDocumentToString" => {
+                    let request =
+                        kiapi::common::commands::SaveDocumentToString::decode(bytes).unwrap();
+                    assert_eq!(request.document.as_ref(), Some(&target));
+                    Some(pack_any(
+                        &kiapi::common::commands::SavedDocumentResponse {
+                            document: request.document,
+                            contents: SAVED.into(),
+                        },
+                        "kiapi.common.commands.SavedDocumentResponse",
+                    ))
+                }
+                "BeginCommit" => Some(pack_any(
+                    &kiapi::common::commands::BeginCommitResponse {
+                        id: Some(kiapi::common::types::Kiid {
+                            value: "trace-commit".into(),
+                        }),
+                    },
+                    "kiapi.common.commands.BeginCommitResponse",
+                )),
+                "UpdateItems" => {
+                    let request = kiapi::common::commands::UpdateItems::decode(bytes).unwrap();
+                    assert_eq!(
+                        request.header.as_ref().and_then(|h| h.document.as_ref()),
+                        Some(&target)
+                    );
+                    assert_eq!(request.items.len(), 1);
+                    assert!(builders::any_is(
+                        &request.items[0],
+                        "kiapi.board.types.Track"
+                    ));
+                    state.updates.push(
+                        kiapi::board::types::Track::decode(request.items[0].value.as_slice())
+                            .unwrap(),
+                    );
+                    Some(pack_any(
+                        &kiapi::common::commands::UpdateItemsResponse {
+                            header: request.header,
+                            status: kiapi::common::types::ItemRequestStatus::IrsOk as i32,
+                            updated_items: vec![kiapi::common::commands::ItemUpdateResult {
+                                status: Some(kiapi::common::commands::ItemStatus {
+                                    code: if matches!(scenario, Scenario::UpdateRejected) {
+                                        kiapi::common::commands::ItemStatusCode::IscUnknown as i32
+                                    } else {
+                                        kiapi::common::commands::ItemStatusCode::IscOk as i32
+                                    },
+                                    error_message: String::new(),
+                                }),
+                                item: Some(request.items[0].clone()),
+                            }],
+                        },
+                        "kiapi.common.commands.UpdateItemsResponse",
+                    ))
+                }
+                "EndCommit" => {
+                    let request = kiapi::common::commands::EndCommit::decode(bytes).unwrap();
+                    assert_eq!(request.id.as_ref().unwrap().value, "trace-commit");
+                    state.actions.push(request.action);
+                    if request.action == kiapi::common::commands::CommitAction::CmaCommit as i32 {
+                        assert_eq!(request.message, "Modify trace");
+                        state.items = vec![pack_any(&state.updates[0], "kiapi.board.types.Track")];
+                        state.published = true;
+                        if matches!(scenario, Scenario::PublishUnknown) {
+                            response.status = None;
+                        }
+                    }
+                    Some(pack_any(
+                        &kiapi::common::commands::EndCommitResponse {},
+                        "kiapi.common.commands.EndCommitResponse",
+                    ))
+                }
+                _ => None,
+            };
+            response
+        });
+        (server, state)
+    }
+
+    fn assert_no_mutation(state: &State) {
+        for name in [
+            "BeginCommit",
+            "UpdateItems",
+            "EndCommit",
+            "CreateItems",
+            "DeleteItems",
+        ] {
+            assert!(
+                !state.calls.iter().any(|call| call == name),
+                "unexpected {name}: {:?}",
+                state.calls
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn same_uuid_locked_and_parent_survive_one_update_commit_on_the_exact_board() {
+        let dir = tempfile::tempdir().unwrap();
+        let board = dir.path().join("target.kicad_pcb");
+        let foreign = dir.path().join("foreign.kicad_pcb");
+        std::fs::write(&board, SAVED).unwrap();
+        for (width, scenario) in [
+            (None, Scenario::Normal),
+            (Some(0.3333334), Scenario::Normal),
+            (None, Scenario::ReadbackCodeOmitted),
+        ] {
+            let original = original_track();
+            let (server, state) = spawn_board(
+                &board,
+                &[&foreign, &board],
+                vec![pack_any(&original, "kiapi.board.types.Track")],
+                scenario,
+            );
+            let mut args = args(&board);
+            if let Some(width) = width {
+                args["width"] = json!(width);
+            }
+            let result = handle_modify_trace(&args, &ctx_talking_to(server.address().into()))
+                .await
+                .unwrap();
+            assert!(!result.is_error, "{}", body(&result));
+            let body = body(&result);
+            assert_eq!(body["modified_uuid"], UUID);
+            assert_eq!(body["net"], "VCC");
+            assert_eq!(body["layer"], "B.Cu");
+            assert_eq!(body["width"], width.map_or(0.25, |_| 0.333333));
+            assert_eq!(body["from"], json!({ "x": 10.0, "y": -2.0 }));
+            assert_eq!(body["to"], json!({ "x": 20.0, "y": 5.0 }));
+            assert_eq!(body["postcondition"], "same_uuid_and_fields_verified");
+            let state = state.lock().unwrap();
+            assert_eq!(state.updates.len(), 1);
+            let mut expected = original.clone();
+            expected.start = Some(builders::vec2(10.0000004, -2.0));
+            expected.end = Some(builders::vec2(20.0, 5.0));
+            expected.width = Some(builders::distance(width.unwrap_or(0.25)));
+            expected.layer = kiapi::board::types::BoardLayer::BlBCu as i32;
+            expected.net = Some(builders::net("VCC", 42));
+            assert_eq!(state.updates[0], expected);
+            assert_eq!(
+                state.actions,
+                vec![kiapi::common::commands::CommitAction::CmaCommit as i32]
+            );
+            for name in ["BeginCommit", "UpdateItems", "EndCommit"] {
+                assert_eq!(
+                    state
+                        .calls
+                        .iter()
+                        .filter(|call| call.as_str() == name)
+                        .count(),
+                    1
+                );
+            }
+            for name in ["CreateItems", "DeleteItems"] {
+                assert!(!state.calls.iter().any(|call| call == name));
+            }
+            assert_eq!(
+                state
+                    .calls
+                    .iter()
+                    .filter(|call| call.as_str() == "GetItems")
+                    .count(),
+                3
+            );
+            assert!(
+                state
+                    .calls
+                    .iter()
+                    .rposition(|call| call == "GetItems")
+                    .unwrap()
+                    > state
+                        .calls
+                        .iter()
+                        .position(|call| call == "EndCommit")
+                        .unwrap()
+            );
+            assert_eq!(std::fs::read_to_string(&board).unwrap(), SAVED);
+        }
+    }
+
+    #[tokio::test]
+    async fn invalid_geometry_layers_and_unresolved_nets_never_mutate() {
+        let dir = tempfile::tempdir().unwrap();
+        let board = dir.path().join("target.kicad_pcb");
+        let (server, state) = spawn_board(
+            &board,
+            &[&board],
+            vec![pack_any(&original_track(), "kiapi.board.types.Track")],
+            Scenario::Normal,
+        );
+        let ctx = ctx_talking_to(server.address().into());
+        for (field, value) in [
+            ("width", json!(0.0)),
+            ("width", json!(-0.2)),
+            ("width", json!(0.0000001)),
+            ("width", json!(2147.483648)),
+            ("width", json!("NaN")),
+            ("width", json!(null)),
+            ("x1", json!(1e308)),
+            ("x1", json!(-2147.483649)),
+            ("y1", json!(2147.483648)),
+            ("x2", json!(2147.483648)),
+            ("y2", json!(2147.483648)),
+            ("layer", json!("Not.A.Layer")),
+            ("layer", json!("Edge.Cuts")),
+            ("layer", json!("In1.Cu")),
+            ("net_name", json!("missing-net")),
+        ] {
+            let mut args = args(&board);
+            args[field] = value;
+            let result = handle_modify_trace(&args, &ctx).await.unwrap();
+            assert!(result.is_error, "accepted {args}");
+        }
+        for x2 in [10.0000004, 10.0000001] {
+            let mut args = args(&board);
+            args["x2"] = json!(x2);
+            args["y2"] = args["y1"].clone();
+            assert!(handle_modify_trace(&args, &ctx).await.unwrap().is_error);
+        }
+        // JSON cannot represent these f64s; exercise the public IPC seam directly.
+        let client = konnect_ipc::KiCadIpcClient::new(server.address());
+        for invalid in [f64::NAN, f64::INFINITY, f64::NEG_INFINITY] {
+            assert!(client
+                .modify_trace_segment(&board, UUID, "VCC", "F.Cu", invalid, 1.0, 2.0, 3.0, 4.0)
+                .is_err());
+            assert!(client
+                .modify_trace_segment(&board, UUID, "VCC", "F.Cu", 0.25, invalid, 2.0, 3.0, 4.0)
+                .is_err());
+        }
+        assert_no_mutation(&state.lock().unwrap());
+    }
+
+    #[tokio::test]
+    async fn missing_foreign_and_nontrack_uuids_and_wrong_boards_never_mutate() {
+        let dir = tempfile::tempdir().unwrap();
+        let board = dir.path().join("target.kicad_pcb");
+        let foreign = dir.path().join("foreign.kicad_pcb");
+        let mut via = builders::build_via("GND", 7, 1.0, 2.0, 0.4, 0.8);
+        via.id = Some(kiapi::common::types::Kiid {
+            value: "via".into(),
+        });
+        let mut arc =
+            builders::build_track_arc("GND", 7, "F.Cu", 0.4, 1.0, 2.0, 2.0, 3.0, 3.0, 4.0);
+        arc.id = Some(kiapi::common::types::Kiid {
+            value: "arc".into(),
+        });
+        let mut disguised = original_track();
+        disguised.id.as_mut().unwrap().value = "compatible-via".into();
+        let mut suffix = original_track();
+        suffix.id.as_mut().unwrap().value = "suffix-track".into();
+        let items = vec![
+            pack_any(&original_track(), "kiapi.board.types.Track"),
+            pack_any(&via, "kiapi.board.types.Via"),
+            pack_any(&arc, "kiapi.board.types.Arc"),
+            pack_any(&disguised, "kiapi.board.types.Via"),
+            pack_any(&suffix, "foreign.kiapi.board.types.Track"),
+        ];
+        let (server, state) = spawn_board(&board, &[&foreign, &board], items, Scenario::Normal);
+        let ctx = ctx_talking_to(server.address().into());
+        for uuid in [
+            "",
+            "missing",
+            "foreign-track",
+            "via",
+            "arc",
+            "compatible-via",
+            "suffix-track",
+        ] {
+            let mut args = args(&board);
+            args["uuid"] = json!(uuid);
+            let result = handle_modify_trace(&args, &ctx).await.unwrap();
+            assert_eq!(body(&result)["error"]["kind"], "stale_target", "{uuid}");
+        }
+        let mut wrong_board = args(&board);
+        wrong_board["board"] = json!(dir.path().join("not-open.kicad_pcb"));
+        let result = handle_modify_trace(&wrong_board, &ctx).await.unwrap();
+        assert_eq!(body(&result)["error"]["kind"], "wrong_document");
+        assert_no_mutation(&state.lock().unwrap());
+    }
+
+    #[tokio::test]
+    async fn incomplete_corrupt_and_duplicate_preimages_refuse_before_mutation() {
+        let dir = tempfile::tempdir().unwrap();
+        let board = dir.path().join("target.kicad_pcb");
+        let original = pack_any(&original_track(), "kiapi.board.types.Track");
+        let mut unknown_lock = original_track();
+        unknown_lock.locked = kiapi::common::types::LockedState::LsUnknown as i32;
+        let mut corrupt = original.clone();
+        corrupt.value = vec![0xff];
+        for items in [
+            vec![pack_any(&unknown_lock, "kiapi.board.types.Track")],
+            vec![corrupt],
+            vec![original.clone(), original.clone()],
+        ] {
+            let (server, state) = spawn_board(&board, &[&board], items, Scenario::Normal);
+            let result =
+                handle_modify_trace(&args(&board), &ctx_talking_to(server.address().into()))
+                    .await
+                    .unwrap();
+            assert!(result.is_error);
+            assert_no_mutation(&state.lock().unwrap());
+        }
+    }
+
+    #[tokio::test]
+    async fn failed_fresh_readback_is_committed_unknown_and_never_retry_safe() {
+        let dir = tempfile::tempdir().unwrap();
+        let board = dir.path().join("target.kicad_pcb");
+        for scenario in [
+            Scenario::ReadbackAbsent,
+            Scenario::ReadbackWrongType,
+            Scenario::ReadbackChangedUuid,
+            Scenario::ReadbackChangedNet,
+            Scenario::ReadbackChanged,
+            Scenario::ReadbackCorrupt,
+            Scenario::ReadbackRejected,
+            Scenario::ReadbackNoPayload,
+            Scenario::ReadbackForeignBoard,
+        ] {
+            let (server, state) = spawn_board(
+                &board,
+                &[&board],
+                vec![pack_any(&original_track(), "kiapi.board.types.Track")],
+                scenario,
+            );
+            let result =
+                handle_modify_trace(&args(&board), &ctx_talking_to(server.address().into()))
+                    .await
+                    .unwrap();
+            assert!(result.is_error, "{scenario:?}");
+            let body = body(&result);
+            assert_eq!(
+                body["error"]["kind"], "ipc_outcome_unknown",
+                "{scenario:?}: {body}"
+            );
+            assert_eq!(body["error"]["board_state"], "committed");
+            assert_eq!(body["error"]["retry_safe"], false);
+            assert!(body.get("modified_uuid").is_none());
+            let state = state.lock().unwrap();
+            assert!(state.published);
+            assert_eq!(state.updates.len(), 1);
+            assert_eq!(
+                state.actions,
+                vec![kiapi::common::commands::CommitAction::CmaCommit as i32]
+            );
+            for name in ["CreateItems", "DeleteItems"] {
+                assert!(!state.calls.iter().any(|call| call == name));
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn uncertain_publication_is_not_retried_or_blindly_dropped() {
+        let dir = tempfile::tempdir().unwrap();
+        let board = dir.path().join("target.kicad_pcb");
+        let (server, state) = spawn_board(
+            &board,
+            &[&board],
+            vec![pack_any(&original_track(), "kiapi.board.types.Track")],
+            Scenario::PublishUnknown,
+        );
+        let result = handle_modify_trace(&args(&board), &ctx_talking_to(server.address().into()))
+            .await
+            .unwrap();
+        let body = body(&result);
+        assert_eq!(body["error"]["kind"], "ipc_outcome_unknown");
+        assert_eq!(body["error"]["board_state"], "unknown");
+        assert_eq!(body["error"]["retry_safe"], false);
+        let state = state.lock().unwrap();
+        assert_eq!(state.updates.len(), 1);
+        assert_eq!(
+            state.actions,
+            vec![kiapi::common::commands::CommitAction::CmaCommit as i32]
+        );
+    }
+
+    #[tokio::test]
+    async fn rejected_update_or_changed_preimage_drops_the_single_native_commit() {
+        let dir = tempfile::tempdir().unwrap();
+        let board = dir.path().join("target.kicad_pcb");
+        for scenario in [Scenario::UpdateRejected, Scenario::PreimageChanged] {
+            let original = vec![pack_any(&original_track(), "kiapi.board.types.Track")];
+            let (server, state) = spawn_board(&board, &[&board], original.clone(), scenario);
+            let result =
+                handle_modify_trace(&args(&board), &ctx_talking_to(server.address().into()))
+                    .await
+                    .unwrap();
+            assert!(result.is_error);
+            let state = state.lock().unwrap();
+            assert!(!state.published);
+            assert_eq!(state.items, original);
+            assert_eq!(
+                state.updates.len(),
+                usize::from(matches!(scenario, Scenario::UpdateRejected))
+            );
+            assert_eq!(
+                state.actions,
+                vec![kiapi::common::commands::CommitAction::CmaDrop as i32]
+            );
+            for name in ["CreateItems", "DeleteItems"] {
+                assert!(!state.calls.iter().any(|call| call == name));
+            }
+        }
+    }
 }
 
 /// The sibling `<project>.kicad_pro`, which is where KiCad ≥ 7 keeps net
