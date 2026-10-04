@@ -89,6 +89,63 @@ footprints 5 mm to the right of it. It used to stage them beside the page origin
 and therefore `plan_revision`, differ from plans computed before this change.
 Apply already requires a fresh dry run.
 
+## Unreleased: `check_freerouting` reports where it searched (minor release)
+
+The `jar_path` argument of `check_freerouting` and `route_specctra_dsn` was
+described as "uses config default", but no Freerouting setting exists. Both
+descriptions now list where discovery looks, in order: the directories named
+by `KICAD10_3RD_PARTY`, `KICAD9_3RD_PARTY` and `KICAD8_3RD_PARTY`; the KiCad
+10.0, 9.0 and 8.0 plugin folders `$HOME/Documents/KiCad/<version>/3rdparty/plugins`,
+`$HOME/.local/share/kicad/<version>/3rdparty/plugins` and, on Windows,
+`$USERPROFILE/Documents/KiCad/<version>/3rdparty/plugins`; `freerouting.jar` in
+the server's working directory; `/usr/local/lib/freerouting` and
+`/opt/freerouting`; then every directory on `PATH`. The search and both
+descriptions are built from the same table of places, and the search itself is
+unchanged.
+
+When nothing is found, `check_freerouting` adds `searched_locations`: one
+entry per location visited, with `kind`, `location_path`, `max_depth` and
+`exists`, read from the server's own environment. `location_path` is always
+absolute: a relative value from the environment is reported against the
+server's working directory, where the search reads it. A location reached twice, such as the
+`Documents` plugin folders when `HOME` and `USERPROFILE` are the same
+directory, is searched once. When `jar_path` is passed and is not a file, it
+reports `checked_path` and says so instead of giving download advice.
+`route_specctra_dsn` now refuses such a `jar_path` with `file_not_found` naming
+the path, where it used to answer "install Freerouting or pass jar_path"
+(#787).
+
+## Unreleased: `suggest_jlcpcb_alternatives` matches KiCad footprints and ranks by library type (minor release)
+
+`suggest_jlcpcb_alternatives` used the last `_` segment of the footprint ID as
+the package, so every standard KiCad footprint (`C_0402_1005Metric` becomes
+`1005Metric`) matched nothing and returned `[]`. It now maps the footprint to
+the package names LCSC uses: two-terminal chip parts to their imperial size
+(`0402`), named discrete packages through a measured alias table (`SOT-23`,
+`SOT-223`, `SOD-123`, `SMA` and others), and SOIC, SOP, TSSOP, MSOP, SSOP,
+quad flat and leadless ICs by pin count and body size. Packages are compared
+exactly, so `0402` no longer also matches `0402x4` arrays. A value without a
+library prefix is still taken as LCSC's own package name, so `footprint: "0402"`
+keeps working. A library footprint with no known LCSC package is refused with
+`invalid_argument` on `footprint`, where it used to return an empty list.
+
+The value now matches as a whole value in the description or the
+manufacturer part number: no digit or `.` may come directly before or after
+it. `10k` used to match `110kΩ` and `510kΩ`, and `20pF` matched `220pF`. Unit
+spellings are not converted; `100nF` does not find `0.1uF`. An empty value is
+refused.
+
+Results used to be ordered by price alone. Parts with fewer than `min_stock_count`
+units in stock (new, default 100) are now excluded. The rest are ranked Basic,
+then Preferred, then Extended when `prefer_basic` (new, default true) is on,
+then known price before unknown, price ascending, stock descending and LCSC
+number. A stored price of 0 is treated as unknown (#582): it sorts after every
+known price, and `max_price_usd` excludes it. The response adds
+`package_match` (the rule and the LCSC names searched), `value_match`,
+`ranking` (the criteria and the effective settings), `count`, `matched_count`
+and `exclusions`, which counts the parts the stock floor and the price limit
+removed (#785).
+
 ## Unreleased: `konnect init` refreshes stale Claude hook matchers (patch release)
 
 A hook's `matcher` is built from the tool registry, so it changes when a board

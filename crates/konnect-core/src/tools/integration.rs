@@ -17,7 +17,7 @@
 
 use crate::mcp::{error::ToolErrorKind, protocol::CallToolResult};
 use crate::tool;
-use crate::tools::{get_path, require_str, ToolContext, ToolDef};
+use crate::tools::{get_path, lcsc_packages, require_str, ToolContext, ToolDef};
 use konnect_sexp::{
     command::{commit_command, prepare_command, ItemId, SchematicCommand},
     parse_sexp,
@@ -84,13 +84,15 @@ pub fn tools() -> Vec<ToolDef> {
         ),
         tool!(
             "suggest_jlcpcb_alternatives",
-            "Suggest JLCPCB-stocked alternative parts for a given component value and footprint.",
+            "Suggest JLCPCB-stocked parts with the same value in the package a KiCad footprint uses. The footprint is mapped to LCSC's package names, the value must match as a whole value, and parts below a stock floor are excluded. Results rank Basic, then Preferred, then Extended parts, then known price and stock; the response states the package names matched, the ranking, and what was excluded.",
             json!({
                 "type": "object",
                 "properties": {
-                    "value": { "type": "string", "description": "Component value (e.g. '100nF')" },
-                    "footprint": { "type": "string", "description": "KiCAD footprint identifier" },
-                    "max_price_usd": { "type": "number", "description": "Maximum unit price in USD (optional)" },
+                    "value": { "type": "string", "description": "Component value or part number, matched case-insensitively as a whole value (no digit or '.' directly before or after) against the part description and manufacturer part number, e.g. '100nF', '10k', 'AMS1117-3.3'. Unit spellings are not converted: '100nF' does not find '0.1uF'" },
+                    "footprint": { "type": "string", "description": "KiCad footprint ID such as 'Capacitor_SMD:C_0402_1005Metric', or LCSC's own package name without a library prefix, such as '0402' or 'LQFP-48(7x7)'. A library footprint with no known LCSC package is refused" },
+                    "max_price_usd": { "type": "number", "description": "Keep only parts whose known unit price is at or below this, in USD (optional). Parts with an unknown price are excluded when it is set" },
+                    "min_stock_count": { "type": "integer", "minimum": 0, "description": "Exclude parts with fewer units in stock. Raise it to the build quantity", "default": 100 },
+                    "prefer_basic": { "type": "boolean", "description": "Rank JLCPCB Basic parts first, then Preferred, then Extended, before price. Extended parts add a setup fee per unique part", "default": true },
                     "limit": { "type": "integer", "description": "Maximum number of suggestions", "default": 5 }
                 },
                 "required": ["value", "footprint"]
@@ -139,7 +141,7 @@ pub fn tools() -> Vec<ToolDef> {
             json!({
                 "type": "object",
                 "properties": {
-                    "jar_path": { "type": "string", "description": "Path to freerouting.jar (optional, uses config default)" }
+                    "jar_path": { "type": "string", "description": freerouting_jar_path_description() }
                 },
                 "required": []
             }),
@@ -153,7 +155,7 @@ pub fn tools() -> Vec<ToolDef> {
                 "properties": {
                     "dsn_path": { "type": "string", "description": "Existing Specctra .dsn input" },
                     "ses_output_path": { "type": "string", "description": "New .ses output path; existing files are never replaced" },
-                    "jar_path": { "type": "string", "description": "Optional Freerouting JAR path; otherwise uses installation discovery" },
+                    "jar_path": { "type": "string", "description": freerouting_jar_path_description() },
                     "max_passes": { "type": "integer", "minimum": 1, "maximum": 100 },
                     "optimizer_enabled": { "type": "boolean" },
                     "job_timeout_seconds": { "type": "integer", "minimum": 1, "maximum": 86400 },
@@ -737,18 +739,214 @@ async fn handle_get_jlcpcb_part(
     }
 }
 
+/// JLCPCB library types in order of preference. Basic parts carry no setup
+/// fee, Preferred parts none for economic assembly, and every unique Extended
+/// part adds one.
+const LIBRARY_TYPE_ORDER: [&str; 3] = ["Basic", "Preferred", "Extended"];
+
+const SUGGEST_DEFAULT_MIN_STOCK_COUNT: u64 = 100;
+
+/// A part that matched both the value and the package, with the columns the
+/// stock floor, price limit and ranking read.
+#[derive(Debug, Clone)]
+struct AlternativeCandidate {
+    part: serde_json::Value,
+    lcsc_id: String,
+    library_type: String,
+    price: f64,
+    stock_count: i64,
+}
+
+impl AlternativeCandidate {
+    /// The import stores a price the feed did not give as 0 (#582), and no
+    /// part is free, so 0 or less means the price is unknown.
+    fn price_known(&self) -> bool {
+        self.price > 0.0
+    }
+
+    fn library_rank(&self) -> usize {
+        LIBRARY_TYPE_ORDER
+            .iter()
+            .position(|kind| *kind == self.library_type)
+            .unwrap_or(LIBRARY_TYPE_ORDER.len())
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+struct AlternativePolicy {
+    min_stock_count: u64,
+    prefer_basic: bool,
+    max_price: Option<f64>,
+    limit: usize,
+}
+
+impl AlternativePolicy {
+    fn criteria(&self) -> Vec<&'static str> {
+        let mut criteria = Vec::new();
+        if self.prefer_basic {
+            criteria.push("library_type: Basic, Preferred, Extended");
+        }
+        criteria.extend([
+            "known price before unknown price",
+            "price ascending",
+            "stock descending",
+            "LCSC number",
+        ]);
+        criteria
+    }
+}
+
+/// What filtering removed and what was returned, so an empty or short result
+/// says why.
+#[derive(Debug, Default, PartialEq, Eq)]
+struct AlternativeCounts {
+    matched: usize,
+    below_min_stock: usize,
+    unknown_price: usize,
+    above_max_price: usize,
+    returned: usize,
+}
+
+/// Apply the stock floor and price limit, then rank. Ranking by price alone
+/// put Extended parts with a dozen units in stock, and parts whose price was
+/// unknown, ahead of the Basic part with millions (#785).
+fn rank_alternatives(
+    candidates: Vec<AlternativeCandidate>,
+    policy: &AlternativePolicy,
+) -> (Vec<AlternativeCandidate>, AlternativeCounts) {
+    let mut counts = AlternativeCounts {
+        matched: candidates.len(),
+        ..AlternativeCounts::default()
+    };
+    let min_stock_count = i64::try_from(policy.min_stock_count).unwrap_or(i64::MAX);
+    let mut kept: Vec<AlternativeCandidate> = Vec::new();
+    for candidate in candidates {
+        if candidate.stock_count < min_stock_count {
+            counts.below_min_stock += 1;
+        } else if let Some(max_price) = policy.max_price {
+            if !candidate.price_known() {
+                counts.unknown_price += 1;
+            } else if candidate.price > max_price {
+                counts.above_max_price += 1;
+            } else {
+                kept.push(candidate);
+            }
+        } else {
+            kept.push(candidate);
+        }
+    }
+
+    let tier = |candidate: &AlternativeCandidate| {
+        if policy.prefer_basic {
+            candidate.library_rank()
+        } else {
+            0
+        }
+    };
+    kept.sort_by(|a, b| {
+        tier(a)
+            .cmp(&tier(b))
+            .then(b.price_known().cmp(&a.price_known()))
+            .then(a.price.total_cmp(&b.price))
+            .then(b.stock_count.cmp(&a.stock_count))
+            .then(a.lcsc_id.cmp(&b.lcsc_id))
+    });
+    kept.truncate(policy.limit);
+    counts.returned = kept.len();
+    (kept, counts)
+}
+
+/// Read every part in one of `packages` whose description or part number
+/// contains `value` as a whole value. SQL narrows by substring; the
+/// whole-value test, which SQLite's LIKE cannot express, runs here.
+fn query_alternative_candidates(
+    db_path: &Path,
+    value: &str,
+    packages: &[String],
+) -> anyhow::Result<Vec<AlternativeCandidate>> {
+    let conn = rusqlite::Connection::open(db_path)?;
+    let placeholders = (1..=packages.len())
+        .map(|i| format!("?{i}"))
+        .collect::<Vec<_>>()
+        .join(", ");
+    let like = packages.len() + 1;
+    let sql = format!(
+        "SELECT LCSC, MFR_Part, Package, Manufacturer, Library_Type, Description, Datasheet, Price, Stock \
+         FROM components WHERE Package COLLATE NOCASE IN ({placeholders}) \
+         AND (Description LIKE ?{like} ESCAPE '\\' OR MFR_Part LIKE ?{like} ESCAPE '\\')"
+    );
+    let escaped = value
+        .replace('\\', "\\\\")
+        .replace('%', "\\%")
+        .replace('_', "\\_");
+    let mut params: Vec<String> = packages.to_vec();
+    params.push(format!("%{escaped}%"));
+
+    let mut statement = conn.prepare(&sql)?;
+    let rows = statement
+        .query_map(rusqlite::params_from_iter(params.iter()), |row| {
+            let mpn: String = row.get::<_, Option<String>>(1)?.unwrap_or_default();
+            let description: String = row.get::<_, Option<String>>(5)?.unwrap_or_default();
+            Ok((
+                mpn,
+                description,
+                AlternativeCandidate {
+                    part: row_to_part_json(row)?,
+                    lcsc_id: row.get::<_, Option<String>>(0)?.unwrap_or_default(),
+                    library_type: row.get::<_, Option<String>>(4)?.unwrap_or_default(),
+                    price: row.get::<_, Option<f64>>(7)?.unwrap_or(0.0),
+                    stock_count: row.get::<_, Option<i64>>(8)?.unwrap_or(0),
+                },
+            ))
+        })?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    Ok(rows
+        .into_iter()
+        .filter(|(mpn, description, _)| {
+            lcsc_packages::contains_whole_value(description, value)
+                || lcsc_packages::contains_whole_value(mpn, value)
+        })
+        .map(|(_, _, candidate)| candidate)
+        .collect())
+}
+
 async fn handle_suggest_alternatives(
     args: &serde_json::Value,
     ctx: &ToolContext,
 ) -> anyhow::Result<CallToolResult> {
     // Arguments before environment — see `handle_search_jlcpcb_parts`.
     let value = match require_str(args, "value") {
-        Ok(v) => v.to_string(),
+        Ok(v) => v.trim().to_string(),
         Err(e) => return Ok(e),
     };
     let footprint = match require_str(args, "footprint") {
-        Ok(v) => v.to_string(),
+        Ok(v) => v.trim().to_string(),
         Err(e) => return Ok(e),
+    };
+    if value.is_empty() {
+        return Ok(CallToolResult::error_kind(
+            ToolErrorKind::InvalidArgument {
+                field: "value".into(),
+                reason: "empty".into(),
+            },
+            "value is empty; give the component value or part number to match",
+        ));
+    }
+    // The package used to be the footprint ID's last `_` segment, which for
+    // every standard KiCad footprint (`C_0402_1005Metric` → `1005Metric`) is
+    // a name LCSC never uses, so the search silently matched nothing (#785).
+    let Some(package_match) = lcsc_packages::lcsc_packages(&footprint) else {
+        return Ok(CallToolResult::error_kind(
+            ToolErrorKind::InvalidArgument {
+                field: "footprint".into(),
+                reason: "no known LCSC package for this footprint".into(),
+            },
+            format!(
+                "No LCSC package name is known for footprint '{footprint}'. Pass LCSC's own \
+                 package name without a library prefix instead, for example '0402', 'SOT-23' \
+                 or 'LQFP-48(7x7)'."
+            ),
+        ));
     };
 
     let db_path = resolve_db_path(args, ctx);
@@ -757,18 +955,14 @@ async fn handle_suggest_alternatives(
             "JLCPCB database not found. Run download_jlcpcb_database first.",
         ));
     }
-    let max_price = args["max_price_usd"].as_f64();
-    let limit = args["limit"].as_u64().unwrap_or(5) as usize;
-
-    // Extract package from footprint (e.g. "Resistor_SMD:R_0402" → "0402")
-    let package_hint = footprint
-        .split(':')
-        .next_back()
-        .unwrap_or("")
-        .split('_')
-        .next_back()
-        .unwrap_or("")
-        .to_string();
+    let policy = AlternativePolicy {
+        min_stock_count: args["min_stock_count"]
+            .as_u64()
+            .unwrap_or(SUGGEST_DEFAULT_MIN_STOCK_COUNT),
+        prefer_basic: args["prefer_basic"].as_bool().unwrap_or(true),
+        max_price: args["max_price_usd"].as_f64(),
+        limit: args["limit"].as_u64().unwrap_or(5) as usize,
+    };
 
     let key = cache_key(
         "suggest_jlcpcb_alternatives",
@@ -776,8 +970,10 @@ async fn handle_suggest_alternatives(
         &[
             &value,
             &footprint,
-            &max_price.map(|v| v.to_string()).unwrap_or_default(),
-            &limit.to_string(),
+            &policy.max_price.map(|v| v.to_string()).unwrap_or_default(),
+            &policy.limit.to_string(),
+            &policy.min_stock_count.to_string(),
+            &policy.prefer_basic.to_string(),
         ],
     );
     if let Some(cached) = ctx.jlcpcb_cache.get(&key) {
@@ -786,33 +982,41 @@ async fn handle_suggest_alternatives(
         return Ok(CallToolResult::text(serde_json::to_string(&body).unwrap()));
     }
 
-    let results = tokio::task::spawn_blocking(move || -> anyhow::Result<Vec<serde_json::Value>> {
-        let conn = rusqlite::Connection::open(&db_path)?;
-        let like_val = format!("%{}%", value);
-        let like_pkg = format!("%{}%", package_hint);
-
-        let mut sql = String::from(
-            "SELECT LCSC, MFR_Part, Package, Manufacturer, Library_Type, Description, Datasheet, Price, Stock \
-             FROM components WHERE Description LIKE ?1 AND Package LIKE ?2 AND Stock > 0"
-        );
-        if let Some(max_p) = max_price {
-            sql.push_str(&format!(" AND Price <= {}", max_p));
-        }
-        sql.push_str(&format!(" ORDER BY Price ASC LIMIT {}", limit));
-
-        let mut stmt = conn.prepare(&sql)?;
-        let rows = stmt
-            .query_map(rusqlite::params![like_val, like_pkg], row_to_part_json)?
-            .filter_map(|r| r.ok())
-            .collect();
-        Ok(rows)
+    let packages = package_match.packages.clone();
+    let query_value = value.clone();
+    let candidates = tokio::task::spawn_blocking(move || {
+        query_alternative_candidates(&db_path, &query_value, &packages)
     })
     .await??;
+    let (alternatives, counts) = rank_alternatives(candidates, &policy);
 
     let body = json!({
-        "value": args["value"].as_str().unwrap_or(""),
-        "footprint": args["footprint"].as_str().unwrap_or(""),
-        "alternatives": results
+        "value": value,
+        "footprint": footprint,
+        "package_match": {
+            "rule": package_match.rule.name(),
+            "lcsc_packages": package_match.packages,
+            "note": "Matched by LCSC's package name, which does not record pitch or exposed-pad size; check the land pattern against the datasheet."
+        },
+        "value_match": {
+            "columns": ["Description", "MFR_Part"],
+            "rule": "whole_value",
+            "note": "Case-insensitive, with no digit or '.' directly before or after the value. Unit spellings are not converted: '100nF' does not find '0.1uF'."
+        },
+        "ranking": {
+            "criteria": policy.criteria(),
+            "prefer_basic": policy.prefer_basic,
+            "min_stock_count": policy.min_stock_count,
+            "max_price_usd": policy.max_price
+        },
+        "count": counts.returned,
+        "matched_count": counts.matched,
+        "exclusions": {
+            "below_min_stock_count": counts.below_min_stock,
+            "unknown_price_count": counts.unknown_price,
+            "above_max_price_count": counts.above_max_price
+        },
+        "alternatives": alternatives.into_iter().map(|candidate| candidate.part).collect::<Vec<_>>()
     });
     ctx.jlcpcb_cache.put(key, body.clone());
 
@@ -1450,72 +1654,274 @@ fn find_freerouting_jar_below(root: &Path, remaining_depth: usize) -> Option<Pat
         })
 }
 
-fn freerouting_search_roots() -> Vec<(PathBuf, usize)> {
-    let mut roots = Vec::new();
+/// Where Freerouting discovery looks when the caller passes no `jar_path`, in
+/// the order it looks. The concrete places come from the tables below, and
+/// both the search and the `jar_path` description are built from those tables,
+/// so what the schema says and what the search does cannot drift apart. There
+/// is no configuration setting: the schema once said "uses config default" for
+/// one that never existed (#787).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+enum FreeroutingLocation {
+    KicadThirdPartyVariable,
+    KicadPluginFolder,
+    WorkingDirectory,
+    SystemDirectory,
+    PathDirectory,
+}
 
-    for variable in ["KICAD10_3RD_PARTY", "KICAD9_3RD_PARTY", "KICAD8_3RD_PARTY"] {
-        if let Some(path) = std::env::var_os(variable) {
-            roots.push((PathBuf::from(path), 5));
+/// The variables naming a KiCad third-party directory, newest KiCad first.
+const FREEROUTING_THIRD_PARTY_VARIABLES: [&str; 3] =
+    ["KICAD10_3RD_PARTY", "KICAD9_3RD_PARTY", "KICAD8_3RD_PARTY"];
+
+/// The KiCad versions whose plugin folders are searched, newest first.
+const FREEROUTING_KICAD_VERSIONS: [&str; 3] = ["10.0", "9.0", "8.0"];
+
+/// Plugin folders below a home directory: the variable naming the home, the
+/// folder below it (`<version>` stands for each version), and whether it is
+/// searched on Windows only.
+const FREEROUTING_PLUGIN_FOLDERS: [(&str, &str, bool); 3] = [
+    ("HOME", "Documents/KiCad/<version>/3rdparty/plugins", false),
+    (
+        "HOME",
+        ".local/share/kicad/<version>/3rdparty/plugins",
+        false,
+    ),
+    (
+        "USERPROFILE",
+        "Documents/KiCad/<version>/3rdparty/plugins",
+        true,
+    ),
+];
+
+/// The JAR looked for in the server's working directory.
+const FREEROUTING_WORKING_DIRECTORY_JAR: &str = "freerouting.jar";
+
+/// System install directories.
+const FREEROUTING_SYSTEM_DIRECTORIES: [&str; 2] =
+    ["/usr/local/lib/freerouting", "/opt/freerouting"];
+
+/// The variable whose directories are searched last.
+const FREEROUTING_PATH_VARIABLE: &str = "PATH";
+
+impl FreeroutingLocation {
+    /// Every location, in search order.
+    const ALL: [Self; 5] = [
+        Self::KicadThirdPartyVariable,
+        Self::KicadPluginFolder,
+        Self::WorkingDirectory,
+        Self::SystemDirectory,
+        Self::PathDirectory,
+    ];
+
+    fn kind(self) -> &'static str {
+        match self {
+            Self::KicadThirdPartyVariable => "kicad_3rd_party_variable",
+            Self::KicadPluginFolder => "kicad_plugin_folder",
+            Self::WorkingDirectory => "working_directory",
+            Self::SystemDirectory => "system_directory",
+            Self::PathDirectory => "path_directory",
         }
     }
 
-    if let Some(home) = std::env::var_os("HOME").map(PathBuf::from) {
-        for version in ["10.0", "9.0", "8.0"] {
-            roots.push((
-                home.join("Documents")
-                    .join("KiCad")
-                    .join(version)
-                    .join("3rdparty")
-                    .join("plugins"),
-                5,
-            ));
-            roots.push((
-                home.join(".local")
-                    .join("share")
-                    .join("kicad")
-                    .join(version)
-                    .join("3rdparty")
-                    .join("plugins"),
-                5,
-            ));
+    /// How many directory levels below one of these roots are searched.
+    fn depth(self) -> usize {
+        match self {
+            Self::KicadThirdPartyVariable | Self::KicadPluginFolder => 5,
+            Self::WorkingDirectory => 0,
+            Self::SystemDirectory => 3,
+            Self::PathDirectory => 1,
         }
     }
 
-    #[cfg(target_os = "windows")]
-    if let Some(profile) = std::env::var_os("USERPROFILE").map(PathBuf::from) {
-        for version in ["10.0", "9.0", "8.0"] {
-            roots.push((
-                profile
-                    .join("Documents")
-                    .join("KiCad")
-                    .join(version)
-                    .join("3rdparty")
-                    .join("plugins"),
-                5,
-            ));
+    fn description(self) -> String {
+        match self {
+            Self::KicadThirdPartyVariable => format!(
+                "the directories named by {}",
+                english_list(
+                    FREEROUTING_THIRD_PARTY_VARIABLES
+                        .iter()
+                        .map(|v| v.to_string())
+                )
+            ),
+            Self::KicadPluginFolder => format!(
+                "the KiCad {} plugin folders {}",
+                english_list(FREEROUTING_KICAD_VERSIONS.iter().map(|v| v.to_string())),
+                english_list(FREEROUTING_PLUGIN_FOLDERS.iter().map(
+                    |(home, folder, windows_only)| {
+                        let place = format!("${home}/{folder}");
+                        if *windows_only {
+                            format!("{place} (Windows only)")
+                        } else {
+                            place
+                        }
+                    }
+                ))
+            ),
+            Self::WorkingDirectory => {
+                format!("{FREEROUTING_WORKING_DIRECTORY_JAR} in the server's working directory")
+            }
+            Self::SystemDirectory => {
+                english_list(FREEROUTING_SYSTEM_DIRECTORIES.iter().map(|d| d.to_string()))
+            }
+            Self::PathDirectory => format!("every directory on {FREEROUTING_PATH_VARIABLE}"),
+        }
+    }
+}
+
+/// `a`, `a and b`, or `a, b and c`.
+fn english_list(items: impl Iterator<Item = String>) -> String {
+    let items: Vec<String> = items.collect();
+    match items.as_slice() {
+        [] => String::new(),
+        [only] => only.clone(),
+        [rest @ .., last] => format!("{} and {last}", rest.join(", ")),
+    }
+}
+
+fn freerouting_jar_path_description() -> String {
+    let locations = FreeroutingLocation::ALL
+        .iter()
+        .map(|location| location.description())
+        .collect::<Vec<_>>()
+        .join("; ");
+    format!(
+        "Path to a Freerouting JAR (optional). When omitted, Konnect searches, in order: \
+         {locations}. Relative paths are taken from the server's working directory. \
+         There is no configuration setting for it."
+    )
+}
+
+/// One place discovery looked, and how many directory levels below it.
+#[derive(Debug, Clone, PartialEq)]
+struct FreeroutingSearchRoot {
+    location: FreeroutingLocation,
+    /// Always absolute: a relative value from the environment is taken from
+    /// the server's working directory, which is where the search reads it.
+    path: PathBuf,
+    depth: usize,
+}
+
+impl FreeroutingSearchRoot {
+    fn evidence(&self) -> serde_json::Value {
+        json!({
+            "kind": self.location.kind(),
+            "location_path": self.path,
+            "max_depth": self.depth,
+            "exists": self.path.exists(),
+        })
+    }
+}
+
+fn freerouting_search_roots() -> Vec<FreeroutingSearchRoot> {
+    freerouting_search_roots_from(
+        |name| std::env::var_os(name),
+        &std::env::current_dir().unwrap_or_default(),
+    )
+}
+
+/// The search roots for a given environment, so a test can supply one without
+/// touching the process's own.
+fn freerouting_search_roots_from(
+    var: impl Fn(&str) -> Option<std::ffi::OsString>,
+    working_directory: &Path,
+) -> Vec<FreeroutingSearchRoot> {
+    let mut roots: Vec<FreeroutingSearchRoot> = Vec::new();
+    let mut push = |location: FreeroutingLocation, path: PathBuf| {
+        let path = if path.is_absolute() {
+            path
+        } else {
+            working_directory.join(path)
+        };
+        // `HOME` and `USERPROFILE` are often the same directory (Git Bash on
+        // Windows sets both), and searching a root twice only repeats it in
+        // the evidence.
+        if !roots.iter().any(|root| root.path == path) {
+            roots.push(FreeroutingSearchRoot {
+                location,
+                depth: location.depth(),
+                path,
+            })
+        }
+    };
+    let below = |base: PathBuf, folder: &str| folder.split('/').fold(base, |p, part| p.join(part));
+
+    for variable in FREEROUTING_THIRD_PARTY_VARIABLES {
+        if let Some(path) = var(variable) {
+            push(
+                FreeroutingLocation::KicadThirdPartyVariable,
+                PathBuf::from(path),
+            );
         }
     }
 
-    roots.extend([
-        (PathBuf::from("freerouting.jar"), 0),
-        (PathBuf::from("/usr/local/lib/freerouting"), 3),
-        (PathBuf::from("/opt/freerouting"), 3),
-    ]);
-    if let Some(path) = std::env::var_os("PATH") {
-        roots.extend(std::env::split_paths(&path).map(|directory| (directory, 1)));
+    let mut homes: Vec<&str> = FREEROUTING_PLUGIN_FOLDERS
+        .iter()
+        .map(|(home, _, _)| *home)
+        .collect();
+    homes.dedup();
+    for home_variable in homes {
+        let Some(home) = var(home_variable).map(PathBuf::from) else {
+            continue;
+        };
+        for version in FREEROUTING_KICAD_VERSIONS {
+            for (variable, folder, windows_only) in FREEROUTING_PLUGIN_FOLDERS {
+                if variable != home_variable || (windows_only && !cfg!(target_os = "windows")) {
+                    continue;
+                }
+                push(
+                    FreeroutingLocation::KicadPluginFolder,
+                    below(home.clone(), &folder.replace("<version>", version)),
+                );
+            }
+        }
+    }
+
+    push(
+        FreeroutingLocation::WorkingDirectory,
+        PathBuf::from(FREEROUTING_WORKING_DIRECTORY_JAR),
+    );
+    for directory in FREEROUTING_SYSTEM_DIRECTORIES {
+        push(
+            FreeroutingLocation::SystemDirectory,
+            PathBuf::from(directory),
+        );
+    }
+    if let Some(path) = var(FREEROUTING_PATH_VARIABLE) {
+        for directory in std::env::split_paths(&path) {
+            push(FreeroutingLocation::PathDirectory, directory);
+        }
     }
     roots
 }
 
-fn find_freerouting_jar(args: &serde_json::Value) -> Option<PathBuf> {
+/// What looking for the Freerouting JAR found.
+#[derive(Debug, PartialEq)]
+enum FreeroutingJar {
+    Found(PathBuf),
+    /// The caller passed `jar_path`, and it is not a file.
+    SuppliedPathIsNotAFile(PathBuf),
+    /// Discovery searched every root and found no JAR.
+    NotFound(Vec<FreeroutingSearchRoot>),
+}
+
+fn resolve_freerouting_jar(args: &serde_json::Value) -> FreeroutingJar {
     if let Some(path) = args["jar_path"].as_str() {
         let path = PathBuf::from(path);
-        return path.is_file().then_some(path);
+        return if path.is_file() {
+            FreeroutingJar::Found(path)
+        } else {
+            FreeroutingJar::SuppliedPathIsNotAFile(path)
+        };
     }
 
-    freerouting_search_roots()
-        .into_iter()
-        .find_map(|(root, depth)| find_freerouting_jar_below(&root, depth))
+    let roots = freerouting_search_roots();
+    match roots
+        .iter()
+        .find_map(|root| find_freerouting_jar_below(&root.path, root.depth))
+    {
+        Some(jar) => FreeroutingJar::Found(jar),
+        None => FreeroutingJar::NotFound(roots),
+    }
 }
 
 fn command_output(output: &std::process::Output) -> String {
@@ -1738,20 +2144,26 @@ async fn handle_check_freerouting(
     args: &serde_json::Value,
     _ctx: &ToolContext,
 ) -> anyhow::Result<CallToolResult> {
-    let jar = find_freerouting_jar(args);
-
-    match jar {
-        None => Ok(CallToolResult::text(
-            serde_json::to_string(&json!({
-                "available": false,
-                "engine_found": false,
-                "native_mcp_available": false,
-                "bridge_available": false,
-                "note": "freerouting.jar not found. Download from https://github.com/freerouting/freerouting/releases"
-            }))
-            .unwrap(),
-        )),
-        Some(jar_path) => {
+    match resolve_freerouting_jar(args) {
+        FreeroutingJar::SuppliedPathIsNotAFile(path) => Ok(CallToolResult::json(&json!({
+            "available": false,
+            "engine_found": false,
+            "native_mcp_available": false,
+            "bridge_available": false,
+            "checked_path": path,
+            "note": format!("jar_path is not a file: {}", path.display())
+        }))),
+        FreeroutingJar::NotFound(roots) => Ok(CallToolResult::json(&json!({
+            "available": false,
+            "engine_found": false,
+            "native_mcp_available": false,
+            "bridge_available": false,
+            "searched_locations": roots.iter().map(FreeroutingSearchRoot::evidence).collect::<Vec<_>>(),
+            "note": "No Freerouting JAR was found in any searched location. Install Freerouting \
+                     (KiCad's Plugin and Content Manager, or \
+                     https://github.com/freerouting/freerouting/releases), or pass jar_path."
+        }))),
+        FreeroutingJar::Found(jar_path) => {
             let mut java_command = tokio::process::Command::new("java");
             java_command.arg("-version");
             let java = match run_java_command(&mut java_command).await {
@@ -1815,10 +2227,23 @@ async fn handle_route_specctra_dsn(
 ) -> anyhow::Result<CallToolResult> {
     let dsn = get_path(args, "dsn_path")?;
     let ses_output = get_path(args, "ses_output_path")?;
-    let Some(jar) = find_freerouting_jar(args) else {
-        return Ok(CallToolResult::error(
-            "Freerouting JAR not found; install Freerouting or pass jar_path",
-        ));
+    let jar = match resolve_freerouting_jar(args) {
+        FreeroutingJar::Found(jar) => jar,
+        FreeroutingJar::SuppliedPathIsNotAFile(path) => {
+            return Ok(CallToolResult::error_kind(
+                ToolErrorKind::FileNotFound {
+                    path: path.display().to_string(),
+                },
+                format!("jar_path is not a file: {}", path.display()),
+            ));
+        }
+        FreeroutingJar::NotFound(roots) => {
+            return Ok(CallToolResult::error(format!(
+                "Freerouting JAR not found in {} searched locations; install Freerouting or \
+                 pass jar_path. check_freerouting lists every location searched.",
+                roots.len()
+            )));
+        }
     };
     let max_passes = args["max_passes"]
         .as_u64()
@@ -1911,7 +2336,10 @@ mod freerouting_tests {
     async fn explicit_missing_jar_reports_each_readiness_boundary() {
         let temp = tempfile::tempdir().unwrap();
         let missing = temp.path().join("missing.jar");
-        assert_eq!(find_freerouting_jar(&json!({ "jar_path": missing })), None);
+        assert_eq!(
+            resolve_freerouting_jar(&json!({ "jar_path": missing })),
+            FreeroutingJar::SuppliedPathIsNotAFile(missing.clone())
+        );
 
         let result = handle_check_freerouting(&json!({ "jar_path": missing }), &test_ctx())
             .await
@@ -1921,6 +2349,325 @@ mod freerouting_tests {
         assert_eq!(body["engine_found"], false);
         assert_eq!(body["native_mcp_available"], false);
         assert_eq!(body["bridge_available"], false);
+        // The caller's path is what was checked; discovery never ran, so
+        // there is no search to report and no download advice to give.
+        assert_eq!(body["checked_path"], json!(missing));
+        assert_eq!(
+            body["note"],
+            json!(format!("jar_path is not a file: {}", missing.display()))
+        );
+        assert!(body.get("searched_locations").is_none(), "{body}");
+    }
+
+    /// A full environment, so every location the search can visit is present.
+    fn every_location_environment(root: &Path) -> HashMap<&'static str, std::ffi::OsString> {
+        let path = std::env::join_paths([root.join("bin-a"), root.join("bin-b")]).unwrap();
+        HashMap::from([
+            ("KICAD10_3RD_PARTY", root.join("k10").into_os_string()),
+            ("KICAD9_3RD_PARTY", root.join("k9").into_os_string()),
+            ("KICAD8_3RD_PARTY", root.join("k8").into_os_string()),
+            ("HOME", root.join("home").into_os_string()),
+            ("USERPROFILE", root.join("profile").into_os_string()),
+            ("PATH", path),
+        ])
+    }
+
+    /// #787: the `jar_path` description is the documentation of the search.
+    /// The search visits locations in the order the description lists them,
+    /// visits every location it lists, and the description promises no
+    /// configuration setting.
+    #[test]
+    fn the_search_visits_the_documented_locations_in_the_documented_order() {
+        let temp = tempfile::tempdir().unwrap();
+        let env = every_location_environment(temp.path());
+        let roots =
+            freerouting_search_roots_from(|name| env.get(name).cloned(), &temp.path().join("cwd"));
+
+        let visited: Vec<FreeroutingLocation> = roots.iter().map(|root| root.location).collect();
+        assert!(
+            visited.windows(2).all(|pair| pair[0] <= pair[1]),
+            "search order differs from the documented order: {visited:?}"
+        );
+        let mut distinct = visited.clone();
+        distinct.dedup();
+        assert_eq!(distinct, FreeroutingLocation::ALL);
+
+        let description = freerouting_jar_path_description();
+        let positions: Vec<usize> = FreeroutingLocation::ALL
+            .iter()
+            .map(|location| {
+                description
+                    .find(location.description().as_str())
+                    .unwrap_or_else(|| panic!("{location:?} is not documented: {description}"))
+            })
+            .collect();
+        assert!(
+            positions.windows(2).all(|pair| pair[0] < pair[1]),
+            "{description}"
+        );
+        assert!(!description.contains("config default"), "{description}");
+        assert!(description.contains("There is no configuration setting"));
+
+        // The working-directory root is absolute, so `searched` names the
+        // file that was actually checked.
+        assert!(roots.contains(&FreeroutingSearchRoot {
+            location: FreeroutingLocation::WorkingDirectory,
+            path: temp.path().join("cwd").join("freerouting.jar"),
+            depth: 0,
+        }));
+        assert_eq!(
+            roots
+                .iter()
+                .filter(|root| root.location == FreeroutingLocation::PathDirectory)
+                .map(|root| root.path.clone())
+                .collect::<Vec<_>>(),
+            [temp.path().join("bin-a"), temp.path().join("bin-b")]
+        );
+    }
+
+    /// The tables name concrete places, not only their categories: every
+    /// variable, KiCad version, plugin folder, file and directory the search
+    /// visits is named in the description, and the search visits each one.
+    #[test]
+    fn the_description_names_every_concrete_place_the_search_visits() {
+        let temp = tempfile::tempdir().unwrap();
+        let env = every_location_environment(temp.path());
+        let cwd = temp.path().join("cwd");
+        let roots = freerouting_search_roots_from(|name| env.get(name).cloned(), &cwd);
+        let searched = |path: PathBuf| roots.iter().any(|root| root.path == path);
+        let description = freerouting_jar_path_description();
+        let named = |text: &str| {
+            assert!(
+                description.contains(text),
+                "{text} is not named: {description}"
+            )
+        };
+
+        for variable in FREEROUTING_THIRD_PARTY_VARIABLES {
+            named(variable);
+            assert!(
+                searched(PathBuf::from(&env[variable])),
+                "{variable}: {roots:?}"
+            );
+        }
+        for version in FREEROUTING_KICAD_VERSIONS {
+            named(version);
+        }
+        for (home, folder, windows_only) in FREEROUTING_PLUGIN_FOLDERS {
+            named(&format!("${home}/{folder}"));
+            if windows_only && !cfg!(target_os = "windows") {
+                continue;
+            }
+            for version in FREEROUTING_KICAD_VERSIONS {
+                let place = folder
+                    .replace("<version>", version)
+                    .split('/')
+                    .fold(PathBuf::from(&env[home]), |p, part| p.join(part));
+                assert!(searched(place.clone()), "{place:?}: {roots:?}");
+            }
+        }
+        named(FREEROUTING_WORKING_DIRECTORY_JAR);
+        assert!(searched(cwd.join(FREEROUTING_WORKING_DIRECTORY_JAR)));
+        for directory in FREEROUTING_SYSTEM_DIRECTORIES {
+            named(directory);
+            assert!(searched(cwd.join(directory)), "{directory}: {roots:?}");
+        }
+        named(FREEROUTING_PATH_VARIABLE);
+        for directory in std::env::split_paths(&env[FREEROUTING_PATH_VARIABLE]) {
+            assert!(searched(directory.clone()), "{directory:?}: {roots:?}");
+        }
+    }
+
+    /// Every searched location is reported as an absolute path. A relative value
+    /// from the environment is taken from the server's working directory, which
+    /// is where the search reads it.
+    #[test]
+    fn every_searched_location_is_absolute() {
+        let temp = tempfile::tempdir().unwrap();
+        let cwd = temp.path().join("cwd");
+        let env = HashMap::from([
+            ("KICAD10_3RD_PARTY", std::ffi::OsString::from("third-party")),
+            ("HOME", std::ffi::OsString::from("home")),
+            ("USERPROFILE", std::ffi::OsString::from("profile")),
+            (
+                "PATH",
+                std::env::join_paths([PathBuf::from("bin"), PathBuf::from(".")]).unwrap(),
+            ),
+        ]);
+        let roots = freerouting_search_roots_from(|name| env.get(name).cloned(), &cwd);
+        for root in &roots {
+            assert!(root.path.is_absolute(), "{root:?}");
+        }
+        assert!(roots
+            .iter()
+            .any(|root| root.path == cwd.join("third-party")));
+        assert!(roots.iter().any(|root| root.path == cwd.join("bin")));
+        let evidence = roots[0].evidence();
+        assert_eq!(evidence["location_path"], json!(cwd.join("third-party")));
+        assert!(evidence.get("path").is_none(), "{evidence}");
+    }
+
+    /// `check_freerouting` with a `jar_path` that is not a file, through the
+    /// served `tools/call`: the path checked is named, and no search ran.
+    #[tokio::test]
+    async fn served_check_freerouting_reports_a_jar_path_that_is_not_a_file() {
+        let temp = tempfile::tempdir().unwrap();
+        let missing = temp.path().join("missing.jar");
+        let handler = crate::mcp::handler::McpHandler::new(ServerConfig {
+            kicad_cli: String::new(),
+            kicad_binary: String::new(),
+            ipc_address: String::new(),
+            project_dir: None,
+            jlcpcb_db_path: None,
+            auto_load_toolsets: true,
+            eager_toolsets: true,
+        })
+        .await
+        .expect("handler builds");
+        let response = handler
+            .handle_message(json!({
+                "jsonrpc": "2.0",
+                "id": 1,
+                "method": "tools/call",
+                "params": {
+                    "name": "check_freerouting",
+                    "arguments": { "jar_path": missing.display().to_string() }
+                }
+            }))
+            .await
+            .expect("tools/call receives a response");
+        let result = response.result.expect("result");
+        assert_ne!(result["isError"], json!(true), "{result}");
+        let body: serde_json::Value =
+            serde_json::from_str(result["content"][0]["text"].as_str().unwrap()).unwrap();
+        assert_eq!(body["engine_found"], false, "{body}");
+        assert_eq!(body["available"], false, "{body}");
+        assert_eq!(body["checked_path"], json!(missing), "{body}");
+        assert_eq!(
+            body["note"],
+            json!(format!("jar_path is not a file: {}", missing.display()))
+        );
+        assert!(body.get("searched_locations").is_none(), "{body}");
+    }
+
+    /// A directory reached twice is searched, and reported, once, under the
+    /// location that reached it first.
+    #[test]
+    fn a_root_reached_twice_is_searched_once() {
+        let temp = tempfile::tempdir().unwrap();
+        let shared = temp.path().join("shared").into_os_string();
+        let path = std::env::join_paths([
+            temp.path().join("bin"),
+            temp.path().join("bin"),
+            PathBuf::from(&shared),
+        ])
+        .unwrap();
+        let env = HashMap::from([
+            ("KICAD10_3RD_PARTY", shared.clone()),
+            ("KICAD9_3RD_PARTY", shared.clone()),
+            ("PATH", path),
+        ]);
+        let roots = freerouting_search_roots_from(|name| env.get(name).cloned(), temp.path());
+
+        let mut paths: Vec<&PathBuf> = roots.iter().map(|root| &root.path).collect();
+        let total = paths.len();
+        paths.sort();
+        paths.dedup();
+        assert_eq!(paths.len(), total, "{roots:?}");
+        assert_eq!(
+            roots
+                .iter()
+                .find(|root| root.path.as_os_str() == shared)
+                .map(|root| root.location),
+            Some(FreeroutingLocation::KicadThirdPartyVariable)
+        );
+        assert_eq!(
+            roots
+                .iter()
+                .filter(|root| root.location == FreeroutingLocation::PathDirectory)
+                .count(),
+            1
+        );
+    }
+
+    /// Both tools that take `jar_path` describe it the same way, through the
+    /// served `tools/list`.
+    #[tokio::test]
+    async fn served_jar_path_descriptions_state_the_search() {
+        let handler = crate::mcp::handler::McpHandler::new(ServerConfig {
+            kicad_cli: String::new(),
+            kicad_binary: String::new(),
+            ipc_address: String::new(),
+            project_dir: None,
+            jlcpcb_db_path: None,
+            auto_load_toolsets: false,
+            eager_toolsets: true,
+        })
+        .await
+        .expect("handler builds");
+        let response = handler
+            .handle_message(json!({"jsonrpc": "2.0", "id": 1, "method": "tools/list"}))
+            .await
+            .expect("tools/list receives a response");
+        let tools = response.result.expect("result")["tools"].clone();
+        for name in ["check_freerouting", "route_specctra_dsn"] {
+            let tool = tools
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|tool| tool["name"] == name)
+                .unwrap_or_else(|| panic!("{name} is not listed"));
+            assert_eq!(
+                tool["inputSchema"]["properties"]["jar_path"]["description"],
+                json!(freerouting_jar_path_description()),
+                "{name}"
+            );
+        }
+    }
+
+    /// `route_specctra_dsn` names the missing file instead of telling a caller
+    /// who passed `jar_path` to pass `jar_path`.
+    #[tokio::test]
+    async fn served_route_refuses_a_jar_path_that_is_not_a_file() {
+        let temp = tempfile::tempdir().unwrap();
+        let missing = temp.path().join("missing.jar");
+        let handler = crate::mcp::handler::McpHandler::new(ServerConfig {
+            kicad_cli: String::new(),
+            kicad_binary: String::new(),
+            ipc_address: String::new(),
+            project_dir: None,
+            jlcpcb_db_path: None,
+            auto_load_toolsets: true,
+            eager_toolsets: true,
+        })
+        .await
+        .expect("handler builds");
+        let response = handler
+            .handle_message(json!({
+                "jsonrpc": "2.0",
+                "id": 1,
+                "method": "tools/call",
+                "params": {
+                    "name": "route_specctra_dsn",
+                    "arguments": {
+                        "dsn_path": temp.path().join("board.dsn").display().to_string(),
+                        "ses_output_path": temp.path().join("board.ses").display().to_string(),
+                        "jar_path": missing.display().to_string()
+                    }
+                }
+            }))
+            .await
+            .expect("tools/call receives a response");
+        let result = response.result.expect("result");
+        assert_eq!(result["isError"], json!(true), "{result}");
+        let body: serde_json::Value =
+            serde_json::from_str(result["content"][0]["text"].as_str().unwrap()).unwrap();
+        assert_eq!(body["error"]["kind"], "file_not_found", "{body}");
+        assert_eq!(body["error"]["path"], json!(missing.display().to_string()));
+        assert_eq!(
+            body["message"],
+            json!(format!("jar_path is not a file: {}", missing.display()))
+        );
     }
 
     #[test]
@@ -2655,5 +3402,313 @@ mod jlcpcb_cache_tests {
         assert_eq!(body["datasheet_url"], serde_json::Value::Null);
         let note = body["note"].as_str().unwrap();
         assert!(note.contains("local catalog"), "{note}");
+    }
+}
+
+#[cfg(test)]
+mod suggest_alternatives_tests {
+    use super::*;
+    use crate::tools::ServerConfig;
+
+    /// Real rows of the Konnect-built catalogue (`components` table), copied
+    /// verbatim from a `download_jlcpcb_database` run on 2026-10-03. The
+    /// README beside it records the source and how the rows were chosen.
+    const FIXTURE: &str = include_str!("../../tests/fixtures/jlcpcb/suggest_alternatives.tsv");
+
+    fn fixture_db() -> (tempfile::TempDir, PathBuf) {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("jlcpcb.db");
+        let conn = rusqlite::Connection::open(&path).unwrap();
+        // The table `build_konnect_jlcpcb_database` creates.
+        conn.execute_batch(
+            "CREATE TABLE components (
+                 LCSC TEXT NOT NULL PRIMARY KEY, MFR_Part TEXT NOT NULL,
+                 Package TEXT NOT NULL, Manufacturer TEXT NOT NULL,
+                 Library_Type TEXT NOT NULL, Description TEXT NOT NULL,
+                 Datasheet TEXT NOT NULL, Price REAL NOT NULL,
+                 Stock INTEGER NOT NULL, Category TEXT NOT NULL
+             );",
+        )
+        .unwrap();
+        let mut lines = FIXTURE.lines();
+        assert_eq!(
+            lines.next().unwrap(),
+            "LCSC\tMFR_Part\tPackage\tManufacturer\tLibrary_Type\tDescription\tDatasheet\tPrice\tStock\tCategory"
+        );
+        for line in lines.filter(|line| !line.is_empty()) {
+            let f: Vec<&str> = line.split('\t').collect();
+            assert_eq!(f.len(), 10, "{line}");
+            conn.execute(
+                "INSERT INTO components VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
+                rusqlite::params![
+                    f[0],
+                    f[1],
+                    f[2],
+                    f[3],
+                    f[4],
+                    f[5],
+                    f[6],
+                    f[7].parse::<f64>().unwrap(),
+                    f[8].parse::<i64>().unwrap(),
+                    f[9]
+                ],
+            )
+            .unwrap();
+        }
+        (dir, path)
+    }
+
+    async fn served(db: &Path, arguments: serde_json::Value) -> (bool, serde_json::Value) {
+        let handler = crate::mcp::handler::McpHandler::new(ServerConfig {
+            kicad_cli: String::new(),
+            kicad_binary: String::new(),
+            ipc_address: String::new(),
+            project_dir: None,
+            jlcpcb_db_path: Some(db.to_path_buf()),
+            auto_load_toolsets: false,
+            eager_toolsets: true,
+        })
+        .await
+        .expect("handler builds");
+        let response = handler
+            .handle_message(json!({
+                "jsonrpc": "2.0",
+                "id": 1,
+                "method": "tools/call",
+                "params": { "name": "suggest_jlcpcb_alternatives", "arguments": arguments }
+            }))
+            .await
+            .expect("tools/call receives a response");
+        let result = response.result.expect("result");
+        let body = serde_json::from_str(result["content"][0]["text"].as_str().unwrap()).unwrap();
+        (result["isError"] == json!(true), body)
+    }
+
+    fn lcsc(body: &serde_json::Value) -> Vec<&str> {
+        body["alternatives"]
+            .as_array()
+            .unwrap_or_else(|| panic!("no alternatives: {body}"))
+            .iter()
+            .map(|part| part["lcsc"].as_str().unwrap())
+            .collect()
+    }
+
+    /// #785: real KiCad 10 footprint IDs reach real parts, the value matches
+    /// as a whole value, and the Basic part with millions in stock comes
+    /// first. On `main` every one of these returned `[]`.
+    #[tokio::test]
+    async fn standard_kicad_footprints_find_the_value_with_the_basic_part_first() {
+        let (_dir, db) = fixture_db();
+        for (value, footprint, expected) in [
+            (
+                "100nF",
+                "Capacitor_SMD:C_0402_1005Metric",
+                vec!["C1525", "C307331", "C285038", "C359190", "C285045"],
+            ),
+            (
+                "10k",
+                "Resistor_SMD:R_0402_1005Metric",
+                vec!["C25744", "C22356213", "C174175"],
+            ),
+            (
+                "20pF",
+                "Capacitor_SMD:C_0402_1005Metric",
+                vec!["C1554", "C107000"],
+            ),
+            (
+                "AMS1117-3.3",
+                "Package_TO_SOT_SMD:SOT-223-3_TabPin2",
+                vec!["C6186", "C2992570"],
+            ),
+            (
+                "STM32F411CEU6",
+                "Package_DFN_QFN:QFN-48-1EP_7x7mm_P0.5mm_EP5.6x5.6mm",
+                vec!["C60420"],
+            ),
+            (
+                "LM358",
+                "Package_SO:SOIC-8_3.9x4.9mm_P1.27mm",
+                vec!["C7950", "C5252902", "C5423"],
+            ),
+        ] {
+            let (is_error, body) =
+                served(&db, json!({ "value": value, "footprint": footprint })).await;
+            assert!(!is_error, "{value} / {footprint}: {body}");
+            assert_eq!(lcsc(&body), expected, "{value} / {footprint}: {body}");
+            assert_eq!(body["count"], expected.len(), "{body}");
+        }
+    }
+
+    /// The evidence for the first case: which packages were searched, how
+    /// the value was matched, the ranking, and what the stock floor removed
+    /// (four parts with 8 to 19 in stock, which used to lead the list).
+    #[tokio::test]
+    async fn the_response_states_the_package_match_ranking_and_exclusions() {
+        let (_dir, db) = fixture_db();
+        let (_, body) = served(
+            &db,
+            json!({ "value": "100nF", "footprint": "Capacitor_SMD:C_0402_1005Metric" }),
+        )
+        .await;
+        assert_eq!(body["package_match"]["rule"], "chip_imperial");
+        assert_eq!(body["package_match"]["lcsc_packages"], json!(["0402"]));
+        assert_eq!(
+            body["value_match"]["columns"],
+            json!(["Description", "MFR_Part"])
+        );
+        assert_eq!(
+            body["ranking"]["criteria"],
+            json!([
+                "library_type: Basic, Preferred, Extended",
+                "known price before unknown price",
+                "price ascending",
+                "stock descending",
+                "LCSC number"
+            ])
+        );
+        assert_eq!(body["ranking"]["min_stock_count"], 100);
+        assert_eq!(body["ranking"]["prefer_basic"], true);
+        assert_eq!(body["count"], 5);
+        assert_eq!(body["matched_count"], 9);
+        assert_eq!(
+            body["exclusions"],
+            json!({
+                "below_min_stock_count": 4,
+                "unknown_price_count": 0,
+                "above_max_price_count": 0
+            })
+        );
+    }
+
+    /// `10k` used to match `110kΩ` and `510kΩ`, and `0402` used to match the
+    /// `0402x4` resistor arrays. Neither is counted as a match now.
+    #[tokio::test]
+    async fn neighbouring_values_and_array_packages_are_not_matches() {
+        let (_dir, db) = fixture_db();
+        let (_, body) = served(
+            &db,
+            json!({
+                "value": "10k",
+                "footprint": "Resistor_SMD:R_0402_1005Metric",
+                "min_stock_count": 0,
+                "limit": 50
+            }),
+        )
+        .await;
+        assert_eq!(lcsc(&body), ["C25744", "C22356213", "C174175"], "{body}");
+        assert_eq!(body["matched_count"], 3, "{body}");
+        for part in body["alternatives"].as_array().unwrap() {
+            assert_eq!(part["package"], "0402", "{part}");
+            assert!(
+                part["description"].as_str().unwrap().contains(" 10kΩ "),
+                "{part}"
+            );
+        }
+    }
+
+    /// Preferred parts rank between Basic and Extended; turning the
+    /// preference off ranks by price.
+    #[tokio::test]
+    async fn library_type_ranks_before_price_unless_turned_off() {
+        let (_dir, db) = fixture_db();
+        let args = |prefer_basic: bool| {
+            json!({
+                "value": "510k",
+                "footprint": "Resistor_SMD:R_0402_1005Metric",
+                "prefer_basic": prefer_basic
+            })
+        };
+        let (_, preferred) = served(&db, args(true)).await;
+        assert_eq!(lcsc(&preferred), ["C11616", "C25564"], "{preferred}");
+        // C170418 has 6 in stock and an unknown price; the floor removes it.
+        assert_eq!(preferred["exclusions"]["below_min_stock_count"], 1);
+
+        let (_, by_price) = served(&db, args(false)).await;
+        assert_eq!(lcsc(&by_price), ["C25564", "C11616"], "{by_price}");
+        assert_eq!(by_price["ranking"]["prefer_basic"], false);
+        assert_eq!(
+            by_price["ranking"]["criteria"][0],
+            "known price before unknown price"
+        );
+    }
+
+    /// #582's stored zero is an unknown price: it sorts after every known
+    /// price, and a price limit excludes it rather than admitting it as free.
+    #[tokio::test]
+    async fn an_unknown_price_never_sorts_as_the_cheapest() {
+        let (_dir, db) = fixture_db();
+        let (_, body) = served(
+            &db,
+            json!({ "value": "1.5M", "footprint": "Resistor_SMD:R_0402_1005Metric" }),
+        )
+        .await;
+        assert_eq!(lcsc(&body), ["C22369344", "C138034", "C11812"], "{body}");
+
+        let (_, limited) = served(
+            &db,
+            json!({
+                "value": "1.5M",
+                "footprint": "Resistor_SMD:R_0402_1005Metric",
+                "max_price_usd": 0.0015
+            }),
+        )
+        .await;
+        assert_eq!(lcsc(&limited), ["C22369344"], "{limited}");
+        assert_eq!(limited["exclusions"]["unknown_price_count"], 1, "{limited}");
+        assert_eq!(
+            limited["exclusions"]["above_max_price_count"], 1,
+            "{limited}"
+        );
+    }
+
+    /// With both overrides relaxed, the old cheapest-first order comes back,
+    /// so a caller who wants it can still have it.
+    #[tokio::test]
+    async fn the_stock_floor_and_preference_are_overridable() {
+        let (_dir, db) = fixture_db();
+        let (_, body) = served(
+            &db,
+            json!({
+                "value": "100nF",
+                "footprint": "0402",
+                "min_stock_count": 0,
+                "prefer_basic": false
+            }),
+        )
+        .await;
+        assert_eq!(
+            lcsc(&body),
+            ["C285038", "C2932181", "C2838746", "C3152530", "C18255880"],
+            "{body}"
+        );
+        assert_eq!(body["package_match"]["rule"], "lcsc_name");
+        assert_eq!(body["exclusions"]["below_min_stock_count"], 0);
+    }
+
+    /// A library footprint the table does not cover is refused, naming the
+    /// argument, instead of returning an empty list that reads as "no
+    /// alternatives exist".
+    #[tokio::test]
+    async fn an_unmapped_footprint_and_an_empty_value_are_refused() {
+        let (_dir, db) = fixture_db();
+        let (is_error, body) = served(
+            &db,
+            json!({
+                "value": "100nF",
+                "footprint": "Connector_PinHeader_2.54mm:PinHeader_1x02_P2.54mm_Vertical"
+            }),
+        )
+        .await;
+        assert!(is_error, "{body}");
+        assert_eq!(body["error"]["kind"], "invalid_argument");
+        assert_eq!(body["error"]["field"], "footprint");
+
+        let (is_error, body) = served(
+            &db,
+            json!({ "value": "  ", "footprint": "Capacitor_SMD:C_0402_1005Metric" }),
+        )
+        .await;
+        assert!(is_error, "{body}");
+        assert_eq!(body["error"]["field"], "value");
     }
 }
