@@ -948,6 +948,12 @@ class Scope:
                 raise Denied("Apply requires the exact latest successful reviewed dry-run revision from this session")
         if effectful(name, args) and not self.policy.writes_enabled:
             raise Denied("Policy has not enabled writes")
+        # Zed may require optional string properties in its tool-call envelope.
+        # Blank BOM column options mean defaults, not explicit empty CLI columns.
+        columns = ("fields", "labels", "group_by") if name == "export_bom" else ("bom_fields", "bom_labels", "bom_group_by") if name == "export_manufacturing_package" else ()
+        for key in columns:
+            if key in args and not args[key].strip():
+                args.pop(key)
         if "output_dir" in args:
             args["output_dir"] = self.policy.output(args["output_dir"], directory=True)
         if "output" in args:
@@ -1321,6 +1327,17 @@ def self_test():
             output.unlink()
             output.symlink_to(self.policy.project)
             self.deny(call("run_drc", {"output": str(output)}))
+
+        def test_blank_bom_options_use_defaults(self):
+            for name, options, output in (
+                ("export_bom", ("fields", "labels", "group_by"), {"output": str(self.policy.exports_root / "bom.csv")}),
+                ("export_manufacturing_package", ("bom_fields", "bom_labels", "bom_group_by"), {"output_dir": str(self.policy.exports_root / "package")})):
+                arguments = self.scope.arguments(name, {**output, **{key: "  " for key in options}})
+                self.assertFalse(set(options).intersection(arguments))
+                arguments = self.scope.arguments(name, {**output, options[0]: "Reference,Value"})
+                self.assertEqual(arguments[options[0]], "Reference,Value")
+            args = self.scope.arguments("edit_schematic_component", {"reference": "R1", "fields": {"Trial": ""}})
+            self.assertEqual(args["fields"]["Trial"], "", "Schematic field clears must not be normalized")
 
         def test_policy_denials(self):
             for updates in ({"writes_enabled": "true"}, {"binary_sha256": "0" * 64},

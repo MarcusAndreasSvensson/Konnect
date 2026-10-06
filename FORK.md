@@ -27,7 +27,7 @@ Rust 1.96.0 and the existing lockfile:
 - Workspace Clippy, all targets, warnings denied: passed.
 - rustfmt and diff whitespace checks: passed.
 - Optimized release: built and qualified as the exact SHA256-pinned installed artifact. Its embedded build commit remains the pre-patch base; the local installation manifest records the final source commit and source hashes separately.
-- Broker authorization/ownership tests: **25 passed**; launcher mocked guards/readiness/detachment tests passed.
+- Broker authorization/ownership/default-argument tests: **26 passed**; launcher mocked guards/readiness/detachment tests passed.
 
 Live disposable scenarios passed for trace identity/lock/group preservation, invalid-edit refusal, subsequent deletion using the same UUID, field ECO identity preservation, courtyard geometry, private configuration and project/global library search.
 
@@ -67,7 +67,7 @@ Do not automatically pull into a dirty tree, stash user changes, force-push, act
 
 The implementation is maintained on this fork's `main`. A durable independent checkout and pinned installation live in the local project's `.kicad-workbench/`, outside the old `.cache` trial. Zed's active `kicad-workbench` connector exposes **34 reviewed tools**, with bounded writes enabled only for the exact disposable LED demo; read-only policy mode exposes 19 tools. The original executable/wrapper and original project Zed settings are retained for rollback. This does not authorize writes to other designs or normal KiCad preferences.
 
-`scripts/workbench/scoped_mcp.py` is the stdlib-only authorization boundary, **not an OS sandbox**. It pins the executable/config/policy/runtime, checks the original launch identity from the first probe, requires the exact sole board, default-denies methods/keys/paths, backs up saved files before writes, and fsyncs mutation intents/results. Uncertain or pending requests persistently block writes. Backup files do not capture unsaved GUI state; same-user interference and GUI races are not atomically excluded.
+`scripts/workbench/scoped_mcp.py` is the stdlib-only authorization boundary, **not an OS sandbox**. It pins the executable/config/policy/runtime, checks the original launch identity from the first probe, requires the exact sole board, default-denies methods/keys/paths, backs up saved files before writes, and fsyncs mutation intents/results. Uncertain or pending requests persistently block writes. Blank optional BOM column strings are normalized to omitted defaults (Zed may require optional strings in its call envelope); explicit empty schematic field values still clear fields. A direct-Zed incomplete BOM export exposed this edge case, correctly blocked writes, and was reconciled only after full live/saved-state checks; its failed package remains archived as incomplete. Backup files do not capture unsaved GUI state; same-user interference and GUI races are not atomically excluded.
 
 `scripts/workbench/launch_workbench.py --policy /absolute/policy.json` performs an explicit private macOS launch. It never guesses a socket or restarts an ambiguous session. Runtime has six exact fields: `ready`, `pid`, `executable`, `board`, `socket`, and `ownership_identity` (process start plus socket/executable device and inode identities). If the editor closes, an operator must inspect the old process, saved/unsaved state and journal, archive reconciled runtime/config/logs and proven stale owned locks, then launch and restart the Zed connector. There is no automatic journal reset, lock deletion or reconnect.
 
