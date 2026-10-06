@@ -1002,7 +1002,8 @@ fn parse_item_pos(item: &serde_json::Value) -> Option<ReportPos> {
 /// KiCAD 10: `pcb drc --output <path> --format json --schematic-parity
 /// [--refill-zones] <input>`
 pub async fn run_drc(cli: &str, pcb: &Path, refill_zones: bool) -> Result<DrcReport> {
-    let out_path = pcb.with_extension("drc.json");
+    let report_dir = tempfile::tempdir()?;
+    let out_path = report_dir.path().join("report.json");
     let args = drc_args(
         out_path.to_str().unwrap(),
         refill_zones,
@@ -1014,7 +1015,6 @@ pub async fn run_drc(cli: &str, pcb: &Path, refill_zones: bool) -> Result<DrcRep
         .await
         .context("DRC output file not found")?;
     let raw: serde_json::Value = serde_json::from_str(&json_str)?;
-    let _ = tokio::fs::remove_file(&out_path).await;
 
     let mut report = parse_drc_report(&raw)?;
     apply_parity_evidence(&mut report, &output.stderr, pcb);
@@ -2066,6 +2066,66 @@ mod pcb_plot_export_tests {
 #[cfg(test)]
 mod drc_parse_tests {
     use super::*;
+
+    #[tokio::test]
+    async fn drc_scratch_is_private_and_preserves_project_files() {
+        let project = tempfile::tempdir().unwrap();
+        let control = tempfile::tempdir().unwrap();
+        let pcb = project.path().join("clock.kicad_pcb");
+        let legacy_report = pcb.with_extension("drc.json");
+        std::fs::write(&pcb, b"(kicad_pcb)").unwrap();
+        std::fs::write(&legacy_report, b"user-owned report").unwrap();
+        let mut paths = std::collections::HashSet::new();
+
+        for (index, (report, exit_code)) in [
+            (
+                Some(r#"{"violations":[],"unconnected_items":[],"schematic_parity":[]}"#),
+                0,
+            ),
+            (Some("partial report"), 7),
+            (Some("not-json"), 0),
+            (None, 0),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let observed = control.path().join(format!("observed-{index}.txt"));
+            let unix_report = report
+                .map(|contents| format!("printf '%s' '{contents}' > \"$4\"\n"))
+                .unwrap_or_default();
+            let windows_report = report
+                .map(|contents| format!("> \"%~4\" echo {contents}\r\n"))
+                .unwrap_or_default();
+            let cli = test_support::write_script(
+                control.path(),
+                &format!("drc-{index}"),
+                &format!(
+                    "#!/bin/sh\nprintf '%s' \"$4\" > \"{}\"\n{unix_report}exit {exit_code}\n",
+                    observed.display()
+                ),
+                &format!(
+                    "@echo off\r\n> \"{}\" echo %~4\r\n{windows_report}exit /b {exit_code}\r\n",
+                    observed.display()
+                ),
+            );
+
+            let result = run_drc(cli.to_str().unwrap(), &pcb, false).await;
+            assert_eq!(result.is_ok(), index == 0, "{result:?}");
+            assert_eq!(std::fs::read(&pcb).unwrap(), b"(kicad_pcb)");
+            assert_eq!(std::fs::read(&legacy_report).unwrap(), b"user-owned report");
+            assert_eq!(std::fs::read_dir(project.path()).unwrap().count(), 2);
+            let path = PathBuf::from(std::fs::read_to_string(observed).unwrap().trim());
+            assert_eq!(
+                path.parent().and_then(Path::parent),
+                Some(std::env::temp_dir().as_path())
+            );
+            assert!(paths.insert(path.clone()), "scratch paths must be unique");
+            assert!(
+                !path.parent().unwrap().exists(),
+                "scratch directory must be cleaned"
+            );
+        }
+    }
 
     /// Real `kicad-cli pcb drc --format json` output (KiCAD 10.0.0, schema
     /// https://schemas.kicad.org/drc.v1.json), captured from the bundled

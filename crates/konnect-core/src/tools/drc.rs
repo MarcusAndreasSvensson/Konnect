@@ -300,15 +300,10 @@ mod tests {
         body
     }
 
-    fn cli_fixture(dir: &Path, board: &Path) -> std::path::PathBuf {
-        std::fs::write(
-            board.with_extension("drc.json"),
-            r#"{"violations":[],"unconnected_items":[],"schematic_parity":[]}"#,
-        )
-        .unwrap();
+    fn cli_fixture(dir: &Path) -> std::path::PathBuf {
         cli::test_support::write_script(dir, "drc-probe",
-            "#!/bin/sh\nfor last; do :; done\ncp \"$last\" \"$last.observed\"\nexit 0\n",
-            "@echo off\r\n:loop\r\nset last=%1\r\nshift\r\nif not \"%1\"==\"\" goto loop\r\ncopy /y %last% %last%.observed >nul\r\nexit /b 0\r\n")
+            "#!/bin/sh\nprintf '%s\n' '{\"violations\":[],\"unconnected_items\":[],\"schematic_parity\":[]}' > \"$4\"\nfor last; do :; done\ncp \"$last\" \"$last.observed\"\nexit 0\n",
+            "@echo off\r\necho {\"violations\":[],\"unconnected_items\":[],\"schematic_parity\":[]} > \"%~4\"\r\n:loop\r\nset last=%1\r\nshift\r\nif not \"%1\"==\"\" goto loop\r\ncopy /y %last% %last%.observed >nul\r\nexit /b 0\r\n")
     }
 
     fn mock(board: &Path, commands: Arc<Mutex<Vec<String>>>, mode: &'static str) -> MockIpcServer {
@@ -416,7 +411,7 @@ mod tests {
             let dir = tempfile::tempdir().unwrap();
             let board = dir.path().join("clock.kicad_pcb");
             std::fs::write(&board, OLD).unwrap();
-            let executable = cli_fixture(dir.path(), &board);
+            let executable = cli_fixture(dir.path());
             let commands = Arc::new(Mutex::new(Vec::new()));
             let server = mock(&board, commands.clone(), "ok");
             let result = call(
@@ -466,7 +461,7 @@ mod tests {
                 let dir = tempfile::tempdir().unwrap();
                 let board = dir.path().join("clock.kicad_pcb");
                 std::fs::write(&board, OLD).unwrap();
-                let executable = cli_fixture(dir.path(), &board);
+                let executable = cli_fixture(dir.path());
                 let commands = Arc::new(Mutex::new(Vec::new()));
                 let server = mock(&board, commands.clone(), mode);
                 let result = call(
@@ -497,7 +492,7 @@ mod tests {
             let dir = tempfile::tempdir().unwrap();
             let board = dir.path().join("clock.kicad_pcb");
             std::fs::write(&board, OLD).unwrap();
-            let executable = cli_fixture(dir.path(), &board);
+            let executable = cli_fixture(dir.path());
             let result = call(tool, &board, "", &executable, json!({})).await;
             assert_eq!(result["isError"], false, "{result}");
             assert_eq!(result["live_board_synced"], false);
@@ -566,7 +561,7 @@ mod tests {
                 let dir = tempfile::tempdir().unwrap();
                 let board = dir.path().join("clock.kicad_pcb");
                 std::fs::write(&board, OLD).unwrap();
-                let executable = cli_fixture(dir.path(), &board);
+                let executable = cli_fixture(dir.path());
                 let result = call(tool, &board, "", &executable, extra).await;
                 assert_eq!(result["isError"], true, "{result}");
                 assert_eq!(std::fs::read_to_string(&board).unwrap(), OLD);
@@ -607,7 +602,6 @@ mod tests {
                 let board = dir.path().join("clock.kicad_pcb");
                 std::fs::write(&board, OLD).unwrap();
                 std::fs::write(board.with_extension("kicad_pcb.replacement"), OLD).unwrap();
-                cli_fixture(dir.path(), &board);
                 let executable = if fail {
                     cli::test_support::write_script(
                         dir.path(),
@@ -617,8 +611,8 @@ mod tests {
                     )
                 } else {
                     cli::test_support::write_script(dir.path(), "changing-drc",
-                        "#!/bin/sh\nfor last; do :; done\ncp \"$last.replacement\" \"$last\"\nexit 0\n",
-                        "@echo off\r\n:loop\r\nset last=%1\r\nshift\r\nif not \"%1\"==\"\" goto loop\r\ncopy /y %last%.replacement %last% >nul\r\nexit /b 0\r\n")
+                        "#!/bin/sh\nprintf '%s\n' '{\"violations\":[],\"unconnected_items\":[],\"schematic_parity\":[]}' > \"$4\"\nfor last; do :; done\ncp \"$last.replacement\" \"$last\"\nexit 0\n",
+                        "@echo off\r\necho {\"violations\":[],\"unconnected_items\":[],\"schematic_parity\":[]} > \"%~4\"\r\n:loop\r\nset last=%1\r\nshift\r\nif not \"%1\"==\"\" goto loop\r\ncopy /y %last%.replacement %last% >nul\r\nexit /b 0\r\n")
                 };
                 let commands = Arc::new(Mutex::new(Vec::new()));
                 let server = mock(&board, commands.clone(), "ok");
@@ -661,7 +655,7 @@ mod tests {
                 let dir = tempfile::tempdir().unwrap();
                 let board = dir.path().join("clock.kicad_pcb");
                 std::fs::write(&board, OLD).unwrap();
-                let executable = cli_fixture(dir.path(), &board);
+                let executable = cli_fixture(dir.path());
                 let output = board.with_extension("report");
                 if preexisting {
                     std::fs::create_dir(&output).unwrap();
@@ -706,7 +700,7 @@ mod tests {
             let dir = tempfile::tempdir().unwrap();
             let board = dir.path().join("clock.kicad_pcb");
             std::fs::write(&board, OLD).unwrap();
-            let executable = cli_fixture(dir.path(), &board);
+            let executable = cli_fixture(dir.path());
             let commands = Arc::new(Mutex::new(Vec::new()));
             let server = mock(&board, commands.clone(), "ok");
             let result = call(
@@ -730,7 +724,7 @@ mod tests {
             let dir = tempfile::tempdir().unwrap();
             let board = dir.path().join("clock.kicad_pcb");
             std::fs::write(&board, OLD).unwrap();
-            let executable = cli_fixture(dir.path(), &board);
+            let executable = cli_fixture(dir.path());
             let output = dir.path().join("report.json");
             std::fs::hard_link(&board, &output).unwrap();
             let result = call(

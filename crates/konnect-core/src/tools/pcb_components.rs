@@ -3930,10 +3930,10 @@ async fn handle_get_board_2d_view(
     let width = args["width"].as_u64().unwrap_or(800).clamp(100, 4000) as u32;
     let height = args["height"].as_u64().unwrap_or(600).clamp(100, 4000) as u32;
 
-    let tmp = board_path.with_extension("render.png");
+    let render_dir = tempfile::tempdir()?;
+    let tmp = render_dir.path().join("render.png");
     super::cli::render_pcb_png(&ctx.config.kicad_cli, &board_path, &tmp, width, height).await?;
     let bytes = tokio::fs::read(&tmp).await?;
-    let _ = tokio::fs::remove_file(&tmp).await;
 
     let b64 = base64::engine::general_purpose::STANDARD.encode(&bytes);
     Ok(CallToolResult::image(b64, "image/png"))
@@ -4347,6 +4347,77 @@ mod tests {
         match res.content.first() {
             Some(crate::mcp::protocol::ToolContent::Text { text }) => text.clone(),
             other => panic!("expected text content, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn board_view_scratch_is_private_and_preserves_project_files() {
+        use base64::Engine;
+
+        let project = tempfile::tempdir().unwrap();
+        let control = tempfile::tempdir().unwrap();
+        let board = project.path().join("clock.kicad_pcb");
+        let legacy_render = board.with_extension("render.png");
+        std::fs::write(&board, b"(kicad_pcb)").unwrap();
+        std::fs::write(&legacy_render, b"user-owned image").unwrap();
+        let mut paths = HashSet::new();
+        let mut ctx = test_ctx();
+
+        for (index, (write_image, exit_code)) in
+            [(true, 0), (true, 7), (false, 0)].into_iter().enumerate()
+        {
+            let observed = control.path().join(format!("observed-{index}.txt"));
+            let unix_image = if write_image {
+                "printf '%s' 'PNG-test' > \"$4\"\n"
+            } else {
+                ""
+            };
+            let windows_image = if write_image {
+                "> \"%~4\" echo PNG-test\r\n"
+            } else {
+                ""
+            };
+            let cli = super::super::cli::test_support::write_script(
+                control.path(),
+                &format!("render-{index}"),
+                &format!(
+                    "#!/bin/sh\nprintf '%s' \"$4\" > \"{}\"\n{unix_image}exit {exit_code}\n",
+                    observed.display()
+                ),
+                &format!(
+                    "@echo off\r\n> \"{}\" echo %~4\r\n{windows_image}exit /b {exit_code}\r\n",
+                    observed.display()
+                ),
+            );
+            ctx.config.kicad_cli = cli.to_str().unwrap().to_string();
+
+            let result = handle_get_board_2d_view(&json!({"board": board}), &ctx).await;
+            assert_eq!(result.is_ok(), index == 0, "{result:?}");
+            if let Ok(result) = result {
+                match &result.content[0] {
+                    crate::mcp::protocol::ToolContent::Image { data, mime_type } => {
+                        assert_eq!(mime_type, "image/png");
+                        assert!(base64::engine::general_purpose::STANDARD
+                            .decode(data)
+                            .unwrap()
+                            .starts_with(b"PNG-test"));
+                    }
+                    other => panic!("expected image content, got {other:?}"),
+                }
+            }
+            assert_eq!(std::fs::read(&board).unwrap(), b"(kicad_pcb)");
+            assert_eq!(std::fs::read(&legacy_render).unwrap(), b"user-owned image");
+            assert_eq!(std::fs::read_dir(project.path()).unwrap().count(), 2);
+            let path = PathBuf::from(std::fs::read_to_string(observed).unwrap().trim());
+            assert_eq!(
+                path.parent().and_then(Path::parent),
+                Some(std::env::temp_dir().as_path())
+            );
+            assert!(paths.insert(path.clone()), "scratch paths must be unique");
+            assert!(
+                !path.parent().unwrap().exists(),
+                "scratch directory must be cleaned"
+            );
         }
     }
 
